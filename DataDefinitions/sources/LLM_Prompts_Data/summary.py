@@ -1,0 +1,2 @@
+
+summary_1 = 'Read the following text and provide a summary. Your summary should be no more than 500 words. Keep as much information within the article but refrain from adding identifying words such as names, people, events, departments. Provide nothing but the summarized text. '
