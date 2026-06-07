@@ -185,29 +185,8 @@ def simulate_firm_month_panel(
     return df, feature_cols
 
 
-def epoch_schedule(target_params: int) -> int:
-    """
-    Give larger models more optimization steps while keeping the smoke run small.
-
-    The training set has about 40k rows, so with batch_size=4096 each epoch is
-    roughly ten optimizer updates. The largest models need more updates than
-    the tiny models to avoid judging them from a barely-trained checkpoint.
-    """
-    schedule = [
-        (1_000, 100),
-        (2_000, 100),
-        (5_000, 100),
-        (10_000, 100),
-        (20_000, 100),
-        (50_000, 100),
-        (100_000, 100),
-        (500_000, 100),
-        (1_000_000, 100),
-    ]
-    for max_params, epochs in schedule:
-        if target_params <= max_params:
-            return epochs
-    return 120
+def get_epochs(size: int) -> int:
+    return max(int((0.1 * (size ** 0.75))), 1) + 10
 
 
 def build_config() -> ScalingLawConfig:
@@ -233,15 +212,15 @@ def build_config() -> ScalingLawConfig:
             "500K",
             "1M"
         ],
-        epochs=epoch_schedule,
+        epochs=get_epochs,
         batch_size=65536,
         prediction_batch_size=65536,
-        learning_rate=0.01,
+        learning_rate=0.001,
         clip_norm=1.0,
         lr_scheduler_enabled=True,
         lr_scheduler_factor=0.5,
-        lr_scheduler_patience=5,
-        lr_scheduler_min_lr=1e-8,
+        lr_scheduler_patience=None,
+        lr_scheduler_min_lr=1e-10,
         test_size="2020-01-31",
         val_size="2017-01-31",
         output_dir=str(OUTPUT_DIR),
