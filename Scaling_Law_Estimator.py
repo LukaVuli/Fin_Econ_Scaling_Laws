@@ -2856,7 +2856,9 @@ class ScalingLawPlotter:
 
         ax.set_xscale('log')
         ax.set_yscale('log')
-        ax.set_ylim(top=1e-1)
+        # Keep a small positive floor on the log-loss axis without clipping
+        # RMSE values that were rescaled from MSE into percentage units.
+        ax.set_ylim(bottom=1e-1)
         ax.set_xlabel(x_label, fontsize=16, fontweight='bold')
 
         loss_names = {'train_loss': 'Training Loss', 'val_loss': 'Validation Loss'}
