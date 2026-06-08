@@ -4,7 +4,7 @@ Synthetic firm-month scaling-law example.
 This script builds a small but nontrivial panel of simulated firm-month returns.
 The data-generating process is intentionally hidden from the estimator:
 
-- 20 monthly Gaussian factors over 300 months
+- 20 monthly Gaussian factors over 200 months by default
 - firm-specific latent characteristics
 - nonlinear firm betas on the factor levels
 - nonlinear firm betas on factor square terms
@@ -186,10 +186,40 @@ def simulate_firm_month_panel(
 
 
 def get_epochs(size: int) -> int:
-    return max(int((0.1 * (size ** 0.75))), 1) + 10
+    return max(int((0.1 * (size ** 0.75))), 1) + 200
 
 
-def build_config() -> ScalingLawConfig:
+def resolve_split_cutoffs(
+        dates: pd.Series,
+        val_months: int = 36,
+        test_months: int = 60,
+) -> Tuple[str, str]:
+    """Choose date cutoffs that fit inside the simulated sample."""
+    unique_dates = sorted(pd.to_datetime(pd.Series(dates)).unique())
+    n_dates = len(unique_dates)
+    total_holdout_months = val_months + test_months
+
+    if n_dates <= total_holdout_months:
+        test_months = max(int(round(n_dates * 0.20)), 1)
+        remaining_dates = max(n_dates - test_months, 2)
+        val_months = max(int(round(n_dates * 0.12)), 1)
+        val_months = min(val_months, remaining_dates - 1)
+
+    val_cutoff_idx = n_dates - (val_months + test_months)
+    test_cutoff_idx = n_dates - test_months
+
+    if val_cutoff_idx <= 0 or test_cutoff_idx <= val_cutoff_idx:
+        raise ValueError(
+            "Could not construct non-empty train/validation/test date cutoffs "
+            f"from {n_dates} unique dates"
+        )
+
+    val_cutoff = pd.Timestamp(unique_dates[val_cutoff_idx]).strftime("%Y-%m-%d")
+    test_cutoff = pd.Timestamp(unique_dates[test_cutoff_idx]).strftime("%Y-%m-%d")
+    return val_cutoff, test_cutoff
+
+
+def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
     """Create a small size-aware scaling-law run configuration."""
     return ScalingLawConfig(
         normalization=NormalizationType.LAYER,
@@ -205,24 +235,24 @@ def build_config() -> ScalingLawConfig:
             "2K",
             "5K",
             "10K",
-            "20K",
-            "50K",
-            "75K",
-            "100K",
-            "500K",
-            "1M"
+            #"20K",
+            #"50K",
+            #"75K",
+            #"100K",
+            #"500K",
+            #"1M"
         ],
         epochs=get_epochs,
         batch_size=65536,
         prediction_batch_size=65536,
-        learning_rate=0.001,
+        learning_rate=0.01,
         clip_norm=1.0,
         lr_scheduler_enabled=True,
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=None,
         lr_scheduler_min_lr=1e-10,
-        test_size="2020-01-31",
-        val_size="2017-01-31",
+        test_size=test_cutoff,
+        val_size=val_cutoff,
         output_dir=str(OUTPUT_DIR),
         save_pickle=True,
         save_json=True,
@@ -266,7 +296,11 @@ def main() -> None:
         f"max={df['ret_exc'].max():.6f}"
     )
 
-    config = build_config()
+    val_cutoff, test_cutoff = resolve_split_cutoffs(df["date"])
+    print(f"Validation cutoff: {val_cutoff}")
+    print(f"Test cutoff: {test_cutoff}")
+
+    config = build_config(val_cutoff=val_cutoff, test_cutoff=test_cutoff)
     experiment = ScalingLawExperiment(config)
     results = experiment.run_from_dataframe(
         df=df,
