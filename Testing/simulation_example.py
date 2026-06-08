@@ -42,11 +42,11 @@ from Scaling_Law_Estimator import (
 )
 
 
-N_MONTHS = 300
+N_MONTHS = 200
 N_FIRMS = 200
 N_FACTORS = 20
 N_FIRM_CHARS = 12
-RANDOM_STATE = 123
+RANDOM_STATE = 42
 
 OUTPUT_DIR = Path.home() / "Desktop" / "scaling law simulation"
 
