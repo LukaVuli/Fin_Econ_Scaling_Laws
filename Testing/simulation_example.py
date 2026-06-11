@@ -186,7 +186,7 @@ def simulate_firm_month_panel(
 
 
 def get_epochs(size: int) -> int:
-    return max(int((0.1 * (size ** 0.75))), 1) + 200
+    return max(int((0.1 * (size ** 0.75))), 1) + 100
 
 
 def resolve_split_cutoffs(
@@ -224,7 +224,7 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
     return ScalingLawConfig(
         normalization=NormalizationType.LAYER,
         architecture_mode=ArchitectureMode.FIXED_DEPTH,
-        fixed_depth_layers=3,
+        fixed_depth_layers=5,
         dropout_rate=0.05,
         dropout_middle_only=True,
         initializer=InitializerType.HE_NORMAL,
@@ -235,8 +235,8 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
             "2K",
             "5K",
             "10K",
-            #"20K",
-            #"50K",
+            "20K",
+            "50K",
             #"75K",
             #"100K",
             #"500K",
@@ -260,7 +260,7 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         save_models=False,
         resume=ResumeMode.OVERWRITE,
         random_state=RANDOM_STATE,
-        mixed_precision_policy="float32",
+        precision=16,
         enable_determinism=True,
         show_live_plots=True,
         debug_memory=False,

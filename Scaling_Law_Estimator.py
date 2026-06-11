@@ -226,9 +226,39 @@ class RuntimeConfig:
 @dataclass
 class ComputeConfig:
     """Compute policy and accounting configuration."""
-    mixed_precision_policy: str = "float32"
+    precision: Union[int, str] = 32
+    mixed_precision_policy: Optional[str] = None
     enable_determinism: bool = True
     flop_estimator: Optional[Callable[[int, int, int, List[int], Model], Union[int, float]]] = None
+    _PRECISION_TO_POLICY: ClassVar[Dict[int, str]] = {
+        8: "mixed_float8",
+        16: "mixed_float16",
+        32: "float32",
+        64: "float64",
+    }
+
+    def __post_init__(self):
+        try:
+            self.precision = int(self.precision)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "precision must be one of 8, 16, 32, or 64"
+            ) from exc
+
+        if self.precision not in self._PRECISION_TO_POLICY:
+            raise ValueError(
+                f"precision must be one of {sorted(self._PRECISION_TO_POLICY)}, "
+                f"got {self.precision!r}"
+            )
+
+        if self.mixed_precision_policy is not None:
+            self.mixed_precision_policy = str(self.mixed_precision_policy)
+
+    def resolve_mixed_precision_policy(self) -> str:
+        """Return the Keras dtype policy implied by this compute configuration."""
+        if self.mixed_precision_policy:
+            return self.mixed_precision_policy
+        return self._PRECISION_TO_POLICY[int(self.precision)]
 
     def estimate_flops_per_epoch(
             self,
@@ -529,6 +559,7 @@ class ScalingLawConfig:
         "resume": ("runtime", "resume"),
         "random_state": ("runtime", "random_state"),
         "run_name": ("runtime", "run_name"),
+        "precision": ("compute", "precision"),
         "mixed_precision_policy": ("compute", "mixed_precision_policy"),
         "enable_determinism": ("compute", "enable_determinism"),
         "flop_estimator": ("compute", "flop_estimator"),
@@ -657,6 +688,7 @@ class ScalingLawConfig:
         """Validate and convert configuration values."""
         self.architecture.__post_init__()
         self.runtime.__post_init__()
+        self.compute.__post_init__()
         self.output.__post_init__()
         self.split.__post_init__()
         self.missing_data.__post_init__()
@@ -687,6 +719,8 @@ class ScalingLawConfig:
                 self.architecture.__post_init__()
             elif config_name == "runtime":
                 self.runtime.__post_init__()
+            elif config_name == "compute":
+                self.compute.__post_init__()
             elif config_name == "output":
                 self.output.__post_init__()
             elif config_name == "split":
@@ -836,6 +870,47 @@ class MemoryManager:
 # CALLBACKS
 # ============================================================================
 
+class R2PercentMetric(tf.keras.metrics.Metric):
+    """Streaming R2 metric reported as a percentage."""
+
+    def __init__(self, name: str = "r2_percent", **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.ss_res = self.add_weight(name="ss_res", initializer="zeros")
+        self.sum_y = self.add_weight(name="sum_y", initializer="zeros")
+        self.sum_y2 = self.add_weight(name="sum_y2", initializer="zeros")
+        self.count = self.add_weight(name="count", initializer="zeros")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true = tf.reshape(tf.cast(y_true, tf.float32), [-1])
+        y_pred = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
+        residual_sq = tf.square(y_true - y_pred)
+
+        if sample_weight is not None:
+            sample_weight = tf.reshape(tf.cast(sample_weight, tf.float32), [-1])
+            residual_sq *= sample_weight
+            y_for_sums = y_true * sample_weight
+            y2_for_sums = tf.square(y_true) * sample_weight
+            count = tf.reduce_sum(sample_weight)
+        else:
+            y_for_sums = y_true
+            y2_for_sums = tf.square(y_true)
+            count = tf.cast(tf.size(y_true), tf.float32)
+
+        self.ss_res.assign_add(tf.reduce_sum(residual_sq))
+        self.sum_y.assign_add(tf.reduce_sum(y_for_sums))
+        self.sum_y2.assign_add(tf.reduce_sum(y2_for_sums))
+        self.count.assign_add(count)
+
+    def result(self):
+        ss_tot = self.sum_y2 - tf.square(self.sum_y) / tf.maximum(self.count, 1.0)
+        r2 = 1.0 - self.ss_res / tf.maximum(ss_tot, tf.keras.backend.epsilon())
+        return 100.0 * r2
+
+    def reset_state(self):
+        for variable in self.variables:
+            variable.assign(0.0)
+
+
 class LivePlotCallback(Callback):
     """Callback that displays training progress in real-time with a live plot."""
 
@@ -927,6 +1002,8 @@ class SingleLineProgressCallback(Callback):
         percent = 100 * current / total
         msg = f"\r[{bar}] {percent:.1f}% | "
         msg += f"Loss: {logs.get('loss', 0):.6f} Val: {logs.get('val_loss', 0):.6f} | "
+        msg += f"Train R2: {logs.get('r2_percent', 0):.2f}% "
+        msg += f"Val R2: {logs.get('val_r2_percent', 0):.2f}% | "
         msg += f"{elapsed_str} < {eta_str}"
 
         sys.stdout.write(msg)
@@ -3351,8 +3428,29 @@ class ScalingLawExperiment:
 
         # Mixed precision
         from tensorflow.keras import mixed_precision
-        mixed_precision.set_global_policy(self.config.mixed_precision_policy)
-        print(f"✓ Compute dtype: {mixed_precision.global_policy().compute_dtype}")
+        precision_policy = self.config.compute.resolve_mixed_precision_policy()
+        try:
+            mixed_precision.set_global_policy(precision_policy)
+        except ValueError as exc:
+            if self.config.precision == 8 and not self.config.mixed_precision_policy:
+                raise ValueError(
+                    "precision=8 maps to the Keras 'mixed_float8' policy, but this "
+                    "TensorFlow/Keras runtime does not appear to support float8 "
+                    "global policies. Use precision=16, 32, or 64, or upgrade to a "
+                    "runtime with float8 policy support."
+                ) from exc
+            raise
+
+        active_policy = mixed_precision.global_policy()
+        precision_label = (
+            "policy override"
+            if self.config.mixed_precision_policy
+            else f"{self.config.precision}-bit"
+        )
+        print(
+            f"✓ Precision: {precision_label} "
+            f"(policy={active_policy.name}, compute dtype={active_policy.compute_dtype})"
+        )
 
     @staticmethod
     def parse_size(s: Union[str, int]) -> int:
@@ -3830,7 +3928,11 @@ class ScalingLawExperiment:
         else:
             optimizer = Adam(learning_rate=self.config.learning_rate)
 
-        model.compile(loss='mean_squared_error', optimizer=optimizer)
+        model.compile(
+            loss='mean_squared_error',
+            optimizer=optimizer,
+            metrics=[R2PercentMetric()]
+        )
 
         # Setup callbacks
         callbacks = [SingleLineProgressCallback()]

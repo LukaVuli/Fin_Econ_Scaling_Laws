@@ -435,7 +435,7 @@ config = ScalingLawConfig(
 config = ScalingLawConfig(
     random_state=42,
     enable_determinism=True,
-    mixed_precision_policy="float32",
+    precision=32,
     debug_memory=False,
     show_live_plots=False,
 )
@@ -1047,11 +1047,12 @@ Models are saved under:
 
 ```python
 config = ScalingLawConfig(
-    mixed_precision_policy="mixed_float16",
+    precision=16,
 )
 ```
 
-Use this only when your hardware and numerical setup are appropriate.
+Supported precision values are `8`, `16`, `32`, and `64`. The default is `32`.
+Use reduced precision only when your hardware and numerical setup are appropriate.
 
 ## Troubleshooting
 
