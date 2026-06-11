@@ -230,17 +230,14 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         initializer=InitializerType.HE_NORMAL,
         use_input_normalization=True,
         param_sizes=[
-            "500",
             "1K",
-            "2K",
             "5K",
             "10K",
             "20K",
             "50K",
-            #"75K",
-            #"100K",
-            #"500K",
-            #"1M"
+            "100K",
+            "500K",
+            "1M"
         ],
         epochs=get_epochs,
         batch_size=65536,

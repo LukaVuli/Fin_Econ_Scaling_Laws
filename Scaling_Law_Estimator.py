@@ -871,40 +871,51 @@ class MemoryManager:
 # ============================================================================
 
 class R2PercentMetric(tf.keras.metrics.Metric):
-    """Streaming R2 metric reported as a percentage."""
+    """Streaming squared-correlation R2 metric reported as a percentage."""
 
     def __init__(self, name: str = "r2_percent", **kwargs):
         super().__init__(name=name, **kwargs)
-        self.ss_res = self.add_weight(name="ss_res", initializer="zeros")
         self.sum_y = self.add_weight(name="sum_y", initializer="zeros")
         self.sum_y2 = self.add_weight(name="sum_y2", initializer="zeros")
+        self.sum_pred = self.add_weight(name="sum_pred", initializer="zeros")
+        self.sum_pred2 = self.add_weight(name="sum_pred2", initializer="zeros")
+        self.sum_y_pred = self.add_weight(name="sum_y_pred", initializer="zeros")
         self.count = self.add_weight(name="count", initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true = tf.reshape(tf.cast(y_true, tf.float32), [-1])
         y_pred = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
-        residual_sq = tf.square(y_true - y_pred)
 
         if sample_weight is not None:
             sample_weight = tf.reshape(tf.cast(sample_weight, tf.float32), [-1])
-            residual_sq *= sample_weight
             y_for_sums = y_true * sample_weight
             y2_for_sums = tf.square(y_true) * sample_weight
+            pred_for_sums = y_pred * sample_weight
+            pred2_for_sums = tf.square(y_pred) * sample_weight
+            y_pred_for_sums = y_true * y_pred * sample_weight
             count = tf.reduce_sum(sample_weight)
         else:
             y_for_sums = y_true
             y2_for_sums = tf.square(y_true)
+            pred_for_sums = y_pred
+            pred2_for_sums = tf.square(y_pred)
+            y_pred_for_sums = y_true * y_pred
             count = tf.cast(tf.size(y_true), tf.float32)
 
-        self.ss_res.assign_add(tf.reduce_sum(residual_sq))
         self.sum_y.assign_add(tf.reduce_sum(y_for_sums))
         self.sum_y2.assign_add(tf.reduce_sum(y2_for_sums))
+        self.sum_pred.assign_add(tf.reduce_sum(pred_for_sums))
+        self.sum_pred2.assign_add(tf.reduce_sum(pred2_for_sums))
+        self.sum_y_pred.assign_add(tf.reduce_sum(y_pred_for_sums))
         self.count.assign_add(count)
 
     def result(self):
-        ss_tot = self.sum_y2 - tf.square(self.sum_y) / tf.maximum(self.count, 1.0)
-        r2 = 1.0 - self.ss_res / tf.maximum(ss_tot, tf.keras.backend.epsilon())
-        return 100.0 * r2
+        count = tf.maximum(self.count, 1.0)
+        y_var = self.sum_y2 - tf.square(self.sum_y) / count
+        pred_var = self.sum_pred2 - tf.square(self.sum_pred) / count
+        cov = self.sum_y_pred - (self.sum_y * self.sum_pred) / count
+        r2 = tf.square(cov) / tf.maximum(y_var * pred_var, tf.keras.backend.epsilon())
+        return 100.0 * tf.clip_by_value(r2, 0.0, 1.0)
 
     def reset_state(self):
         for variable in self.variables:
