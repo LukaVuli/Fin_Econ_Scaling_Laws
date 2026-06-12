@@ -25,9 +25,6 @@ import os
 from pathlib import Path
 from typing import List, Tuple
 
-# Use a noninteractive backend so plot generation does not require a GUI window.
-os.environ.setdefault("MPLBACKEND", "Agg")
-
 import numpy as np
 import pandas as pd
 
@@ -225,7 +222,7 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         normalization=NormalizationType.LAYER,
         architecture_mode=ArchitectureMode.FIXED_DEPTH,
         fixed_depth_layers=5,
-        dropout_rate=0.05,
+        dropout_rate=0.0,
         dropout_middle_only=True,
         initializer=InitializerType.HE_NORMAL,
         use_input_normalization=True,
@@ -242,7 +239,7 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         epochs=get_epochs,
         batch_size=65536,
         prediction_batch_size=65536,
-        learning_rate=0.01,
+        learning_rate=0.1,
         clip_norm=1.0,
         lr_scheduler_enabled=True,
         lr_scheduler_factor=0.5,

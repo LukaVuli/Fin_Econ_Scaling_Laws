@@ -214,6 +214,7 @@ class SchedulerConfig:
 class RuntimeConfig:
     """Runtime behavior and reproducibility configuration."""
     show_live_plots: bool = False
+    show_live_r2: bool = True
     debug_memory: bool = False
     resume: Union[ResumeMode, bool, str] = ResumeMode.UPDATE_EXISTING
     random_state: int = 42
@@ -555,6 +556,7 @@ class ScalingLawConfig:
         "lr_scheduler_patience": ("scheduler", "lr_scheduler_patience"),
         "lr_scheduler_min_lr": ("scheduler", "lr_scheduler_min_lr"),
         "show_live_plots": ("runtime", "show_live_plots"),
+        "show_live_r2": ("runtime", "show_live_r2"),
         "debug_memory": ("runtime", "debug_memory"),
         "resume": ("runtime", "resume"),
         "random_state": ("runtime", "random_state"),
@@ -923,71 +925,237 @@ class R2PercentMetric(tf.keras.metrics.Metric):
 
 
 class LivePlotCallback(Callback):
-    """Callback that displays training progress in real-time with a live plot."""
+    """Callback that displays training progress in real-time with a live plot.
 
-    def __init__(self):
+    Implementation note: this callback embeds a matplotlib Figure inside a
+    self-managed Tk window via FigureCanvasTkAgg and drives Tk's event loop
+    directly. It deliberately does not use pyplot for the live window, because
+    pyplot's behavior depends on the active matplotlib backend — and on macOS
+    in PyCharm the default backend (MacOSX, or worse PyCharm's snapshot-only
+    'module://backend_interagg') will not propagate canvas updates from a
+    script context. Tk + FigureCanvasTkAgg bypasses backend negotiation
+    entirely and works the same whether you Run, Debug, or paste into the
+    PyCharm Python console.
+    """
+
+    def __init__(self, show_r2: bool = True, target_params: Optional[int] = None):
         super().__init__()
+        self.show_r2 = show_r2
+        self.target_params = target_params
         self.losses: List[float] = []
         self.val_losses: List[float] = []
+        self.r2_values: List[float] = []
+        self.val_r2_values: List[float] = []
         self.epochs_list: List[int] = []
+        self.root = None
         self.fig = None
         self.ax = None
+        self.ax_r2 = None
+        self.canvas = None
+        self.train_line = None
+        self.val_line = None
+        self.train_r2_line = None
+        self.val_r2_line = None
+
+    @staticmethod
+    def _format_params(n: int) -> str:
+        """Compact human-readable parameter count, e.g. 5K, 1.5K, 1M.
+
+        Strips trailing zeros so round targets like 5_000 / 1_000_000
+        render as '5K' / '1M' (matching what the user typed in
+        param_sizes), while non-round values like 1500 still render
+        accurately as '1.5K'.
+        """
+        if n >= 1_000_000:
+            value, suffix = n / 1_000_000, "M"
+        elif n >= 1_000:
+            value, suffix = n / 1_000, "K"
+        else:
+            return str(int(n))
+        text = f"{value:.2f}".rstrip("0").rstrip(".")
+        return f"{text}{suffix}"
 
     def on_train_begin(self, logs=None):
         self.losses = []
         self.val_losses = []
+        self.r2_values = []
+        self.val_r2_values = []
         self.epochs_list = []
-        plt.ion()
-        self.fig, self.ax = plt.subplots(figsize=(10, 6))
 
-    def on_epoch_end(self, epoch, logs=None):
-        logs = logs or {}
-        self.epochs_list.append(epoch)
-        self.losses.append(logs.get('loss'))
-        self.val_losses.append(logs.get('val_loss'))
+        # Lazy imports so a missing tkinter on a headless box only fails
+        # when show_live_plots is actually requested.
+        import tkinter as tk
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-        self.ax.clear()
-        self.ax.plot(self.epochs_list, self.losses, 'b-', label='Training Loss', linewidth=2)
-        self.ax.plot(self.epochs_list, self.val_losses, 'r-', label='Validation Loss', linewidth=2)
+        # Prefer the user-specified target size (e.g. 5_000 → "5K") so
+        # the title matches what was set in param_sizes. Fall back to
+        # the realized parameter count if no target was passed in.
+        if self.target_params is not None:
+            n_params = int(self.target_params)
+        else:
+            try:
+                n_params = int(self.model.count_params())
+            except Exception:
+                n_params = 0
+        title_text = (
+            f"Training Progress — {self._format_params(n_params)} parameters"
+        )
+
+        self.root = tk.Tk()
+        self.root.title(title_text)
+
+        # Use a bare Figure (not plt.figure) so we never touch pyplot's
+        # global state for the live window.
+        self.fig = Figure(figsize=(10, 6))
+        self.ax = self.fig.add_subplot(111)
+        self.train_line, = self.ax.plot([], [], 'b-', label='Training Loss', linewidth=2)
+        self.val_line, = self.ax.plot([], [], 'r-', label='Validation Loss', linewidth=2)
         self.ax.set_xlabel('Epoch')
         self.ax.set_ylabel('Loss (RMSE in Percent)')
-        self.ax.set_title('Training Progress')
-        self.ax.legend()
+        self.ax.set_title(title_text)
         self.ax.grid(True, alpha=0.3)
         self.ax.set_yscale('log')
 
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
+        if self.show_r2:
+            self.ax_r2 = self.ax.twinx()
+            self.train_r2_line, = self.ax_r2.plot(
+                [], [], 'b--', label='Training R²', linewidth=2
+            )
+            self.val_r2_line, = self.ax_r2.plot(
+                [], [], 'r--', label='Validation R²', linewidth=2
+            )
+            self.ax_r2.set_ylabel('R² (%)')
+            handles = [
+                self.train_line, self.val_line,
+                self.train_r2_line, self.val_r2_line,
+            ]
+            labels = [
+                'Training Loss', 'Validation Loss',
+                'Training R²', 'Validation R²',
+            ]
+            self.ax.legend(handles, labels, loc='upper left')
+        else:
+            self.ax.legend(loc='upper left')
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.canvas.draw()
+
+        # Drain Tk's event queue so the window actually appears now,
+        # before TF starts hammering the main thread with compute.
+        self.root.update()
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        loss = logs.get('loss')
+        val_loss = logs.get('val_loss')
+        if loss is None or val_loss is None:
+            return
+
+        loss = float(loss)
+        val_loss = float(val_loss)
+
+        self.epochs_list.append(epoch)
+        # Mask non-finite or non-positive values with NaN so a single
+        # bad epoch shows up as a gap, not as a vanished line.
+        self.losses.append(loss if np.isfinite(loss) and loss > 0 else np.nan)
+        self.val_losses.append(val_loss if np.isfinite(val_loss) and val_loss > 0 else np.nan)
+
+        self.train_line.set_data(self.epochs_list, self.losses)
+        self.val_line.set_data(self.epochs_list, self.val_losses)
+
+        # Compute axis limits explicitly. autoscale_view on a log axis
+        # with a small number of points often refuses to move off the
+        # default (1, 10) range, which would render the curves
+        # off-screen for losses below 1.
+        finite_y = [v for v in (*self.losses, *self.val_losses)
+                    if v is not None and np.isfinite(v) and v > 0]
+        if finite_y:
+            ymin = min(finite_y)
+            ymax = max(finite_y)
+            if ymin == ymax:
+                ymin, ymax = ymin / 2.0, ymax * 2.0
+            self.ax.set_ylim(ymin / 1.2, ymax * 1.2)
+        if self.epochs_list:
+            xmax = max(self.epochs_list)
+            self.ax.set_xlim(-0.5, max(xmax, 1) + 0.5)
+
+        if self.show_r2 and self.ax_r2 is not None:
+            r2 = logs.get('r2_percent')
+            val_r2 = logs.get('val_r2_percent')
+            r2_val = float(r2) if r2 is not None else np.nan
+            val_r2_val = float(val_r2) if val_r2 is not None else np.nan
+            if not np.isfinite(r2_val):
+                r2_val = np.nan
+            if not np.isfinite(val_r2_val):
+                val_r2_val = np.nan
+
+            self.r2_values.append(r2_val)
+            self.val_r2_values.append(val_r2_val)
+
+            self.train_r2_line.set_data(self.epochs_list, self.r2_values)
+            self.val_r2_line.set_data(self.epochs_list, self.val_r2_values)
+
+            finite_r2 = [v for v in (*self.r2_values, *self.val_r2_values)
+                         if v is not None and np.isfinite(v)]
+            if finite_r2:
+                r2min = min(finite_r2)
+                r2max = max(finite_r2)
+                if r2min == r2max:
+                    r2min, r2max = r2min - 1.0, r2max + 1.0
+                pad = max((r2max - r2min) * 0.1, 0.1)
+                self.ax_r2.set_ylim(r2min - pad, r2max + pad)
+
+        if self.canvas is not None:
+            self.canvas.draw()
+        if self.root is not None:
+            # Pump Tk's event loop so the OS actually paints the new
+            # frame between epochs.
+            self.root.update()
 
     def on_train_end(self, logs=None):
-        plt.ioff()
         self.cleanup()
 
     def cleanup(self):
         """Manual cleanup method."""
-        if self.fig is not None:
-            plt.close(self.fig)
-        plt.close('all')
+        if self.root is not None:
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
         self.losses = []
         self.val_losses = []
+        self.r2_values = []
+        self.val_r2_values = []
         self.epochs_list = []
+        self.root = None
         self.fig = None
         self.ax = None
+        self.ax_r2 = None
+        self.canvas = None
+        self.train_line = None
+        self.val_line = None
+        self.train_r2_line = None
+        self.val_r2_line = None
 
 
 class SingleLineProgressCallback(Callback):
-    """Callback that prints training progress on a single updating line with timing."""
+    """Callback that prints compact training progress with timing."""
 
     def __init__(self):
         super().__init__()
         self.total_epochs = 0
         self.start_time = 0
         self.epoch_times: List[float] = []
+        self.progress_lines = 4
+        self.has_progress_block = False
 
     def on_train_begin(self, logs=None):
         self.total_epochs = self.params['epochs']
         self.start_time = time.time()
         self.epoch_times = []
+        self.has_progress_block = False
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
@@ -1006,23 +1174,34 @@ class SingleLineProgressCallback(Callback):
         elapsed_str = self._format_time(elapsed)
         eta_str = self._format_time(eta)
 
-        bar_length = 40
+        bar_length = 20
         filled = int(bar_length * current / total)
         bar = '█' * filled + '░' * (bar_length - filled)
 
         percent = 100 * current / total
-        msg = f"\r[{bar}] {percent:.1f}% | "
-        msg += f"Loss: {logs.get('loss', 0):.6f} Val: {logs.get('val_loss', 0):.6f} | "
-        msg += f"Train R2: {logs.get('r2_percent', 0):.2f}% "
-        msg += f"Val R2: {logs.get('val_r2_percent', 0):.2f}% | "
-        msg += f"{elapsed_str} < {eta_str}"
+        train_loss = np.sqrt(max(logs.get('loss', 0), 0)) * 100
+        val_loss = np.sqrt(max(logs.get('val_loss', 0), 0)) * 100
+        train_r2 = logs.get('r2_percent', 0)
+        val_r2 = logs.get('val_r2_percent', 0)
+        line = (
+            f"[{bar}] Epoch: {current:>{len(str(total))}}/{total} ({percent:.1f}%) | "
+            f"Runtime: {elapsed_str} and ETA: {eta_str} | "
+            f"Train Loss: {train_loss:.2f}% (R2: {train_r2:.2f}%) | "
+            f"Val Loss: {val_loss:.2f}% (R2: {val_r2:.2f}%)"
+        )
 
-        sys.stdout.write(msg)
+        pad = max(0, getattr(self, '_last_line_len', 0) - len(line))
+        sys.stdout.write("\r" + line + (" " * pad))
         sys.stdout.flush()
+        self._last_line_len = len(line)
+        self.has_progress_block = True
 
     def on_train_end(self, logs=None):
-        print()
+        if self.has_progress_block:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
         self.epoch_times = []
+        self.has_progress_block = False
 
     @staticmethod
     def _format_time(seconds: float) -> str:
@@ -1426,12 +1605,12 @@ class ResultsManager:
             if existing_result.get('model_name') == model_name:
                 current_results_list[i] = result
                 found = True
-                print(f"  ↻ Updated existing entry for {model_name}")
+                print(f"Save Status: Updated existing entry for {model_name}")
                 break
 
         if not found:
             current_results_list.append(result)
-            print(f"  + Added new entry for {model_name}")
+            print(f"Save Status: Added new entry for {model_name}")
 
         self.pkl_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.pkl_path, 'wb') as f:
@@ -3047,7 +3226,7 @@ class ScalingLawPlotter:
         ax.tick_params(labelsize=12)
 
         if fit_curve:
-            ax.legend(fontsize=13, loc='best', framealpha=0.9)
+            ax.legend(fontsize=13, loc='upper left', framealpha=0.9)
 
         plt.tight_layout()
 
@@ -3129,7 +3308,7 @@ class ScalingLawPlotter:
         ax.tick_params(labelsize=12)
 
         if fit_curve:
-            ax.legend(fontsize=13, loc='best', framealpha=0.9)
+            ax.legend(fontsize=13, loc='upper left', framealpha=0.9)
 
         plt.tight_layout()
 
@@ -3361,7 +3540,7 @@ class ScalingLawPlotter:
         ax.axhline(y=0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
         ax.tick_params(labelsize=16)
 
-        ax.legend(fontsize=16, loc='best', framealpha=0.9)
+        ax.legend(fontsize=16, loc='upper left', framealpha=0.9)
 
         plt.tight_layout()
 
@@ -3922,7 +4101,6 @@ class ScalingLawExperiment:
 
         print(f"Architecture: {architecture}")
         print(f"Actual parameters: {actual_params:,}")
-        print(f"Normalization: {self.config.normalization.value}")
 
         flops_per_epoch = float(self.config.compute.estimate_flops_per_epoch(
             actual_params=actual_params,
@@ -3961,7 +4139,10 @@ class ScalingLawExperiment:
 
         live_plot = None
         if self.config.show_live_plots:
-            live_plot = LivePlotCallback()
+            live_plot = LivePlotCallback(
+                show_r2=self.config.show_live_r2,
+                target_params=target_params,
+            )
             callbacks.append(live_plot)
 
         if self.config.debug_memory:
@@ -4072,9 +4253,20 @@ class ScalingLawExperiment:
         total_flops = cumulative_flops[-1]
         total_pf_days = cumulative_pf_days[-1]
 
-        print(f"\nResults: Train={train_loss:.6f} | Val={val_loss:.6f} (R²={val_r2:.4f}) | "
-              f"Test={test_mse:.6f} (R²={test_r2:.4f})")
-        print(f"Time: {train_time:.1f}s | Compute: {total_pf_days:.2e} PF-days")
+        print("\n" + "-" * 80)
+        print("MODEL RESULTS")
+        print("-" * 80)
+        print("Loss Metrics")
+        print(f"  Train Loss:       {train_loss:.6f}")
+        print(f"  Validation Loss:  {val_loss:.6f}")
+        print(f"  Test Loss:        {test_mse:.6f}")
+        print("R2 Metrics")
+        print(f"  Validation R2:    {val_r2:.4f}")
+        print(f"  Test R2:          {test_r2:.4f}")
+        print("Runtime and Compute")
+        print(f"  Training Time:    {train_time:.1f}s")
+        print(f"  Total Compute:    {total_pf_days:.2e} PF-days")
+        print("-" * 80)
 
         # Build results dictionary
         results_dict = {
@@ -4349,7 +4541,6 @@ class ScalingLawExperiment:
         print(f"Epochs: {'Variable by size' if callable(self.config.epochs) else self.config.epochs}")
         print(f"Batch size: {self.config.batch_size}")
         print(f"Learning rate: {self.config.learning_rate}")
-        print(f"Normalization: {self.config.normalization.value}")
         print(f"Architecture mode: {self.config.architecture_mode.value}")
         print(f"Portfolio mode: {portfolio_mode}")
         if portfolio_mode == "ts":
@@ -4426,7 +4617,7 @@ class ScalingLawExperiment:
                 self.results_manager.save_result_to_pickle(result)
                 self.results_manager.save_result_to_json()
 
-                print(f"✓ Results saved to {self.config.output_dir}")
+                print(f"Output Directory: {self.config.output_dir}")
 
                 del result
                 MemoryManager.aggressive_cleanup()

@@ -1,0 +1,10 @@
+# Core numerical / ML stack
+tensorflow>=2.16
+tensorflow-metal>=1.2.0; platform_system == "Darwin" and platform_machine == "arm64"
+numpy>=1.26
+pandas>=2.2
+scipy>=1.11
+matplotlib>=3.8
+
+# Optional memory diagnostics
+psutil>=5.9
