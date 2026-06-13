@@ -927,6 +927,11 @@ class R2PercentMetric(tf.keras.metrics.Metric):
 class LivePlotCallback(Callback):
     """Callback that displays training progress in real-time with a live plot.
 
+    Uses a single persistent Tk window for the whole process: the first
+    training builds it, every subsequent training reuses the same window and
+    wipes its history so the new run starts from scratch in-place. No new
+    windows ever spawn.
+
     Implementation note: this callback embeds a matplotlib Figure inside a
     self-managed Tk window via FigureCanvasTkAgg and drives Tk's event loop
     directly. It deliberately does not use pyplot for the live window, because
@@ -938,6 +943,19 @@ class LivePlotCallback(Callback):
     PyCharm Python console.
     """
 
+    # Singleton window state shared across all instances so we reuse the
+    # same Tk window for every training instead of opening a new one.
+    _root: ClassVar[Any] = None
+    _fig: ClassVar[Any] = None
+    _ax: ClassVar[Any] = None
+    _ax_r2: ClassVar[Any] = None
+    _canvas: ClassVar[Any] = None
+    _train_line: ClassVar[Any] = None
+    _val_line: ClassVar[Any] = None
+    _train_r2_line: ClassVar[Any] = None
+    _val_r2_line: ClassVar[Any] = None
+    _window_has_r2: ClassVar[bool] = False
+
     def __init__(self, show_r2: bool = True, target_params: Optional[int] = None):
         super().__init__()
         self.show_r2 = show_r2
@@ -947,15 +965,6 @@ class LivePlotCallback(Callback):
         self.r2_values: List[float] = []
         self.val_r2_values: List[float] = []
         self.epochs_list: List[int] = []
-        self.root = None
-        self.fig = None
-        self.ax = None
-        self.ax_r2 = None
-        self.canvas = None
-        self.train_line = None
-        self.val_line = None
-        self.train_r2_line = None
-        self.val_r2_line = None
 
     @staticmethod
     def _format_params(n: int) -> str:
@@ -975,18 +984,95 @@ class LivePlotCallback(Callback):
         text = f"{value:.2f}".rstrip("0").rstrip(".")
         return f"{text}{suffix}"
 
-    def on_train_begin(self, logs=None):
-        self.losses = []
-        self.val_losses = []
-        self.r2_values = []
-        self.val_r2_values = []
-        self.epochs_list = []
-
+    @classmethod
+    def _build_window(cls, show_r2: bool):
         # Lazy imports so a missing tkinter on a headless box only fails
         # when show_live_plots is actually requested.
         import tkinter as tk
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        cls._root = tk.Tk()
+        cls._root.title("Training Progress")
+        cls._root.protocol("WM_DELETE_WINDOW", cls._on_window_close)
+        cls._window_has_r2 = show_r2
+
+        # Use a bare Figure (not plt.figure) so we never touch pyplot's
+        # global state for the live window.
+        cls._fig = Figure(figsize=(10, 6))
+        cls._ax = cls._fig.add_subplot(111)
+        cls._train_line, = cls._ax.plot(
+            [], [], 'b-', label='Training Loss', linewidth=2
+        )
+        cls._val_line, = cls._ax.plot(
+            [], [], 'r-', label='Validation Loss', linewidth=2
+        )
+        cls._ax.set_xlabel('Epoch')
+        cls._ax.set_ylabel('Loss (RMSE in Percent)')
+        cls._ax.grid(True, alpha=0.3)
+        cls._ax.set_yscale('log')
+
+        if show_r2:
+            cls._ax_r2 = cls._ax.twinx()
+            cls._train_r2_line, = cls._ax_r2.plot(
+                [], [], 'b--', label='Training R²', linewidth=2
+            )
+            cls._val_r2_line, = cls._ax_r2.plot(
+                [], [], 'r--', label='Validation R²', linewidth=2
+            )
+            cls._ax_r2.set_ylabel('R² (%)')
+            handles = [
+                cls._train_line, cls._val_line,
+                cls._train_r2_line, cls._val_r2_line,
+            ]
+            labels = [
+                'Training Loss', 'Validation Loss',
+                'Training R²', 'Validation R²',
+            ]
+            cls._ax.legend(handles, labels, loc='upper left')
+        else:
+            cls._ax_r2 = None
+            cls._train_r2_line = None
+            cls._val_r2_line = None
+            cls._ax.legend(loc='upper left')
+
+        cls._canvas = FigureCanvasTkAgg(cls._fig, master=cls._root)
+        cls._canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        cls._canvas.draw()
+
+        # Drain Tk's event queue so the window actually appears now,
+        # before TF starts hammering the main thread with compute.
+        cls._root.update()
+
+    @classmethod
+    def _reset_state(cls):
+        cls._root = None
+        cls._fig = None
+        cls._ax = None
+        cls._ax_r2 = None
+        cls._canvas = None
+        cls._train_line = None
+        cls._val_line = None
+        cls._train_r2_line = None
+        cls._val_r2_line = None
+        cls._window_has_r2 = False
+
+    @classmethod
+    def _on_window_close(cls):
+        try:
+            if cls._root is not None:
+                cls._root.destroy()
+        except Exception:
+            pass
+        cls._reset_state()
+
+    def on_train_begin(self, logs=None):
+        # Wipe history so the new model's plot starts from scratch.
+        self.losses = []
+        self.val_losses = []
+        self.r2_values = []
+        self.val_r2_values = []
+        self.epochs_list = []
 
         # Prefer the user-specified target size (e.g. 5_000 → "5K") so
         # the title matches what was set in param_sizes. Fall back to
@@ -1002,55 +1088,30 @@ class LivePlotCallback(Callback):
             f"Training Progress — {self._format_params(n_params)} parameters"
         )
 
-        self.root = tk.Tk()
-        self.root.title(title_text)
+        cls = type(self)
+        if cls._root is None:
+            cls._build_window(self.show_r2)
 
-        # Use a bare Figure (not plt.figure) so we never touch pyplot's
-        # global state for the live window.
-        self.fig = Figure(figsize=(10, 6))
-        self.ax = self.fig.add_subplot(111)
-        self.train_line, = self.ax.plot([], [], 'b-', label='Training Loss', linewidth=2)
-        self.val_line, = self.ax.plot([], [], 'r-', label='Validation Loss', linewidth=2)
-        self.ax.set_xlabel('Epoch')
-        self.ax.set_ylabel('Loss (RMSE in Percent)')
-        self.ax.set_title(title_text)
-        self.ax.grid(True, alpha=0.3)
-        self.ax.set_yscale('log')
-
-        if self.show_r2:
-            self.ax_r2 = self.ax.twinx()
-            self.train_r2_line, = self.ax_r2.plot(
-                [], [], 'b--', label='Training R²', linewidth=2
-            )
-            self.val_r2_line, = self.ax_r2.plot(
-                [], [], 'r--', label='Validation R²', linewidth=2
-            )
-            self.ax_r2.set_ylabel('R² (%)')
-            handles = [
-                self.train_line, self.val_line,
-                self.train_r2_line, self.val_r2_line,
-            ]
-            labels = [
-                'Training Loss', 'Validation Loss',
-                'Training R²', 'Validation R²',
-            ]
-            self.ax.legend(handles, labels, loc='upper left')
-        else:
-            self.ax.legend(loc='upper left')
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.canvas.draw()
-
-        # Drain Tk's event queue so the window actually appears now,
-        # before TF starts hammering the main thread with compute.
-        self.root.update()
+        # Reset the existing window's axes and lines in-place.
+        cls._root.title(title_text)
+        cls._ax.set_title(title_text)
+        cls._train_line.set_data([], [])
+        cls._val_line.set_data([], [])
+        if cls._ax_r2 is not None and cls._train_r2_line is not None:
+            cls._train_r2_line.set_data([], [])
+            cls._val_r2_line.set_data([], [])
+        cls._canvas.draw()
+        cls._root.update()
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         loss = logs.get('loss')
         val_loss = logs.get('val_loss')
         if loss is None or val_loss is None:
+            return
+
+        cls = type(self)
+        if cls._root is None or cls._canvas is None:
             return
 
         loss = float(loss)
@@ -1062,8 +1123,8 @@ class LivePlotCallback(Callback):
         self.losses.append(loss if np.isfinite(loss) and loss > 0 else np.nan)
         self.val_losses.append(val_loss if np.isfinite(val_loss) and val_loss > 0 else np.nan)
 
-        self.train_line.set_data(self.epochs_list, self.losses)
-        self.val_line.set_data(self.epochs_list, self.val_losses)
+        cls._train_line.set_data(self.epochs_list, self.losses)
+        cls._val_line.set_data(self.epochs_list, self.val_losses)
 
         # Compute axis limits explicitly. autoscale_view on a log axis
         # with a small number of points often refuses to move off the
@@ -1076,12 +1137,12 @@ class LivePlotCallback(Callback):
             ymax = max(finite_y)
             if ymin == ymax:
                 ymin, ymax = ymin / 2.0, ymax * 2.0
-            self.ax.set_ylim(ymin / 1.2, ymax * 1.2)
+            cls._ax.set_ylim(ymin / 1.2, ymax * 1.2)
         if self.epochs_list:
             xmax = max(self.epochs_list)
-            self.ax.set_xlim(-0.5, max(xmax, 1) + 0.5)
+            cls._ax.set_xlim(-0.5, max(xmax, 1) + 0.5)
 
-        if self.show_r2 and self.ax_r2 is not None:
+        if cls._ax_r2 is not None and cls._train_r2_line is not None:
             r2 = logs.get('r2_percent')
             val_r2 = logs.get('val_r2_percent')
             r2_val = float(r2) if r2 is not None else np.nan
@@ -1094,8 +1155,8 @@ class LivePlotCallback(Callback):
             self.r2_values.append(r2_val)
             self.val_r2_values.append(val_r2_val)
 
-            self.train_r2_line.set_data(self.epochs_list, self.r2_values)
-            self.val_r2_line.set_data(self.epochs_list, self.val_r2_values)
+            cls._train_r2_line.set_data(self.epochs_list, self.r2_values)
+            cls._val_r2_line.set_data(self.epochs_list, self.val_r2_values)
 
             finite_r2 = [v for v in (*self.r2_values, *self.val_r2_values)
                          if v is not None and np.isfinite(v)]
@@ -1105,39 +1166,35 @@ class LivePlotCallback(Callback):
                 if r2min == r2max:
                     r2min, r2max = r2min - 1.0, r2max + 1.0
                 pad = max((r2max - r2min) * 0.1, 0.1)
-                self.ax_r2.set_ylim(r2min - pad, r2max + pad)
+                cls._ax_r2.set_ylim(r2min - pad, r2max + pad)
 
-        if self.canvas is not None:
-            self.canvas.draw()
-        if self.root is not None:
-            # Pump Tk's event loop so the OS actually paints the new
-            # frame between epochs.
-            self.root.update()
+        cls._canvas.draw()
+        # Pump Tk's event loop so the OS actually paints the new
+        # frame between epochs.
+        cls._root.update()
 
     def on_train_end(self, logs=None):
-        self.cleanup()
+        # Window stays open; next on_train_begin will repaint in place.
+        return
 
     def cleanup(self):
-        """Manual cleanup method."""
-        if self.root is not None:
+        """No-op: the window is intentionally persistent across runs.
+
+        Kept for backwards compatibility with the per-model call site
+        that historically tore the window down after each fit. Use
+        ``_teardown`` to actually close the singleton window.
+        """
+        return
+
+    @classmethod
+    def _teardown(cls):
+        """Explicitly tear down the persistent window."""
+        if cls._root is not None:
             try:
-                self.root.destroy()
+                cls._root.destroy()
             except Exception:
                 pass
-        self.losses = []
-        self.val_losses = []
-        self.r2_values = []
-        self.val_r2_values = []
-        self.epochs_list = []
-        self.root = None
-        self.fig = None
-        self.ax = None
-        self.ax_r2 = None
-        self.canvas = None
-        self.train_line = None
-        self.val_line = None
-        self.train_r2_line = None
-        self.val_r2_line = None
+        cls._reset_state()
 
 
 class SingleLineProgressCallback(Callback):
@@ -3240,6 +3297,7 @@ class ScalingLawPlotter:
     def plot_sharpe_ratio_scaling(
             self,
             breakpoint: str = '50',
+            portfolio: Optional[str] = None,
             x_axis: str = 'compute',
             fit_curve: bool = True,
             figsize: Tuple[int, int] = (12, 8),
@@ -3248,12 +3306,25 @@ class ScalingLawPlotter:
             dpi: int = 300,
             use_compute_weighting: bool = False
     ) -> Tuple[Optional[plt.Figure], Optional[plt.Axes]]:
-        """Plot Sharpe ratio vs model size/compute."""
+        """Plot Sharpe ratio vs model size/compute.
+
+        If `portfolio` is provided (e.g. 'Forecast_Weighted'), it is used directly
+        as the portfolio_stats key. Otherwise the long-short LS_{breakpoint} key
+        is used.
+        """
         results = self._load_results()
         print(f"\nLoaded {len(results)} models")
 
-        breakpoint_key = f'LS_{breakpoint}'
-        breakpoint_label = f'{breakpoint}% Breakpoint'
+        if portfolio is not None:
+            breakpoint_key = portfolio
+            breakpoint_label = portfolio.replace('_', ' ')
+            save_suffix = portfolio
+            title_prefix = 'Portfolio Sharpe Ratio'
+        else:
+            breakpoint_key = f'LS_{breakpoint}'
+            breakpoint_label = f'{breakpoint}% Breakpoint'
+            save_suffix = f'LS{breakpoint}'
+            title_prefix = 'Long-Short Portfolio Sharpe Ratio'
 
         params_list, sharpe_list, compute_list = [], [], []
 
@@ -3300,7 +3371,7 @@ class ScalingLawPlotter:
         ax.set_ylabel('Annualized Sharpe Ratio', fontsize=16, fontweight='bold')
 
         if title is None:
-            title = f'Long-Short Portfolio Sharpe Ratio ({breakpoint_label})'
+            title = f'{title_prefix} ({breakpoint_label})'
         ax.set_title(title, fontsize=18, fontweight='bold', pad=20)
 
         ax.grid(True, alpha=0.3, linestyle='--')
@@ -3313,7 +3384,7 @@ class ScalingLawPlotter:
         plt.tight_layout()
 
         if save_name is None:
-            save_name = f'sharpe_ratio_LS{breakpoint}_vs_{x_axis}.png'
+            save_name = f'sharpe_ratio_{save_suffix}_vs_{x_axis}.png'
         save_path = self.results_path / save_name
         plt.savefig(save_path, dpi=dpi, bbox_inches='tight', facecolor='white')
         print(f"✓ Plot saved to: {save_path}")
@@ -3321,8 +3392,18 @@ class ScalingLawPlotter:
 
         return fig, ax
 
-    def create_all_plots(self, dpi: int = 300, use_compute_weighting: bool = False):
-        """Create comprehensive set of scaling law plots."""
+    def create_all_plots(
+            self,
+            dpi: int = 300,
+            use_compute_weighting: bool = False,
+            include_ls_breakpoints: bool = False,
+    ):
+        """Create comprehensive set of scaling law plots.
+
+        By default the forecast-weighted portfolio Sharpe is plotted.
+        Set `include_ls_breakpoints=True` to additionally plot the LS_50,
+        LS_30, and LS_10 long-short breakpoint Sharpe ratios.
+        """
         print("\n" + "=" * 80)
         print("CREATING SCALING LAW VISUALIZATIONS")
         print("=" * 80)
@@ -3363,29 +3444,38 @@ class ScalingLawPlotter:
             use_compute_weighting=use_compute_weighting
         )
 
-        print("\n5. Sharpe Ratio LS50 vs Compute")
+        print("\n5. Sharpe Ratio Forecast-Weighted vs Compute")
         self.plot_sharpe_ratio_scaling(
-            breakpoint='50',
+            portfolio='Forecast_Weighted',
             x_axis='compute',
             dpi=dpi,
             use_compute_weighting=use_compute_weighting
         )
 
-        print("\n6. Sharpe Ratio LS30 vs Compute")
-        self.plot_sharpe_ratio_scaling(
-            breakpoint='30',
-            x_axis='compute',
-            dpi=dpi,
-            use_compute_weighting=use_compute_weighting
-        )
+        if include_ls_breakpoints:
+            print("\n6. Sharpe Ratio LS50 vs Compute")
+            self.plot_sharpe_ratio_scaling(
+                breakpoint='50',
+                x_axis='compute',
+                dpi=dpi,
+                use_compute_weighting=use_compute_weighting
+            )
 
-        print("\n7. Sharpe Ratio LS10 vs Compute")
-        self.plot_sharpe_ratio_scaling(
-            breakpoint='10',
-            x_axis='compute',
-            dpi=dpi,
-            use_compute_weighting=use_compute_weighting
-        )
+            print("\n7. Sharpe Ratio LS30 vs Compute")
+            self.plot_sharpe_ratio_scaling(
+                breakpoint='30',
+                x_axis='compute',
+                dpi=dpi,
+                use_compute_weighting=use_compute_weighting
+            )
+
+            print("\n8. Sharpe Ratio LS10 vs Compute")
+            self.plot_sharpe_ratio_scaling(
+                breakpoint='10',
+                x_axis='compute',
+                dpi=dpi,
+                use_compute_weighting=use_compute_weighting
+            )
 
         print("\n" + "=" * 80)
         print("ALL PLOTS CREATED SUCCESSFULLY")
@@ -4004,6 +4094,123 @@ class ScalingLawExperiment:
         )
         return val_benchmark, test_benchmark
 
+    def _save_training_history_plot(
+            self,
+            history_dict: Dict[str, List[float]],
+            target_params: int,
+            model_name: str,
+            show_r2: bool,
+    ) -> Optional[Path]:
+        """Render the training-history plot for one model and save it to disk.
+
+        Mirrors the styling of LivePlotCallback (log-scale loss, twin R²
+        axis when available) but builds a fresh, off-screen Figure so the
+        save works regardless of whether the live window was shown. The
+        PNG lands next to where the model would be saved, at
+        ``Models/<model_name>_training.png``.
+        """
+        try:
+            from matplotlib.figure import Figure
+        except Exception as exc:
+            print(f"⚠ Could not import matplotlib to save training plot: {exc}")
+            return None
+
+        losses = [
+            float(v) if v is not None and np.isfinite(v) and v > 0 else np.nan
+            for v in history_dict.get('loss', [])
+        ]
+        val_losses = [
+            float(v) if v is not None and np.isfinite(v) and v > 0 else np.nan
+            for v in history_dict.get('val_loss', [])
+        ]
+        if not losses:
+            return None
+        epochs_list = list(range(len(losses)))
+
+        r2_values = history_dict.get('r2_percent')
+        val_r2_values = history_dict.get('val_r2_percent')
+        plot_r2 = bool(show_r2 and r2_values is not None and val_r2_values is not None)
+        if plot_r2:
+            r2_values = [
+                float(v) if v is not None and np.isfinite(float(v)) else np.nan
+                for v in r2_values
+            ]
+            val_r2_values = [
+                float(v) if v is not None and np.isfinite(float(v)) else np.nan
+                for v in val_r2_values
+            ]
+
+        n_params = int(target_params)
+        if n_params >= 1_000_000:
+            value, suffix = n_params / 1_000_000, "M"
+            size_text = f"{value:.2f}".rstrip("0").rstrip(".") + suffix
+        elif n_params >= 1_000:
+            value, suffix = n_params / 1_000, "K"
+            size_text = f"{value:.2f}".rstrip("0").rstrip(".") + suffix
+        else:
+            size_text = str(n_params)
+        title_text = f"Training Progress — {size_text} parameters"
+
+        fig = Figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        train_line, = ax.plot(epochs_list, losses, 'b-',
+                              label='Training Loss', linewidth=2)
+        val_line, = ax.plot(epochs_list, val_losses, 'r-',
+                            label='Validation Loss', linewidth=2)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Loss (RMSE in Percent)')
+        ax.set_title(title_text)
+        ax.grid(True, alpha=0.3)
+        ax.set_yscale('log')
+
+        finite_y = [v for v in (*losses, *val_losses)
+                    if v is not None and np.isfinite(v) and v > 0]
+        if finite_y:
+            ymin = min(finite_y)
+            ymax = max(finite_y)
+            if ymin == ymax:
+                ymin, ymax = ymin / 2.0, ymax * 2.0
+            ax.set_ylim(ymin / 1.2, ymax * 1.2)
+        if epochs_list:
+            ax.set_xlim(-0.5, max(epochs_list[-1], 1) + 0.5)
+
+        if plot_r2:
+            ax_r2 = ax.twinx()
+            train_r2_line, = ax_r2.plot(epochs_list, r2_values, 'b--',
+                                        label='Training R²', linewidth=2)
+            val_r2_line, = ax_r2.plot(epochs_list, val_r2_values, 'r--',
+                                      label='Validation R²', linewidth=2)
+            ax_r2.set_ylabel('R² (%)')
+            finite_r2 = [v for v in (*r2_values, *val_r2_values)
+                         if v is not None and np.isfinite(v)]
+            if finite_r2:
+                r2min = min(finite_r2)
+                r2max = max(finite_r2)
+                if r2min == r2max:
+                    r2min, r2max = r2min - 1.0, r2max + 1.0
+                pad = max((r2max - r2min) * 0.1, 0.1)
+                ax_r2.set_ylim(r2min - pad, r2max + pad)
+            ax.legend(
+                [train_line, val_line, train_r2_line, val_r2_line],
+                ['Training Loss', 'Validation Loss',
+                 'Training R²', 'Validation R²'],
+                loc='upper left',
+            )
+        else:
+            ax.legend(loc='upper left')
+
+        try:
+            models_dir = self.results_manager.models_dir
+            models_dir.mkdir(parents=True, exist_ok=True)
+            save_path = models_dir / f"{model_name}_training.png"
+            fig.savefig(str(save_path), dpi=100, bbox_inches='tight')
+            return save_path
+        except Exception as exc:
+            print(f"⚠ Could not save training plot for {model_name}: {exc}")
+            return None
+        finally:
+            fig.clear()
+
     def train_single_model(
             self,
             X_train: np.ndarray,
@@ -4160,6 +4367,15 @@ class ScalingLawExperiment:
             callbacks=callbacks
         )
         train_time = time.time() - start_time
+
+        # Persist the training-history plot to disk so it can be inspected
+        # later — independent of whether the live window was shown.
+        self._save_training_history_plot(
+            history.history,
+            target_params=target_params,
+            model_name=model_name,
+            show_r2=self.config.show_live_r2,
+        )
 
         if self.config.debug_memory:
             MemoryManager.print_memory_usage("AFTER training")
@@ -4747,10 +4963,15 @@ class ScalingLawExperiment:
 
         print(f"{'=' * len(header)}\n")
 
-    def create_plots(self, dpi: int = 300):
-        """Create all scaling law visualizations."""
+    def create_plots(self, dpi: int = 300, include_ls_breakpoints: bool = False):
+        """Create all scaling law visualizations.
+
+        Set `include_ls_breakpoints=True` to also produce the LS_50, LS_30,
+        and LS_10 long-short breakpoint Sharpe plots in addition to the
+        default forecast-weighted Sharpe plot.
+        """
         plotter = ScalingLawPlotter(self.config.output_dir, self.config.output.artifacts)
-        plotter.create_all_plots(dpi=dpi)
+        plotter.create_all_plots(dpi=dpi, include_ls_breakpoints=include_ls_breakpoints)
         self._print_results_table()
 
 
