@@ -4,12 +4,11 @@ Characteristic-driven next-month return scaling-law simulation.
 This script mirrors the empirical timing in the paper more directly than the
 factor-beta simulation:
 
-- firm-month characteristics are observed at month t
+- 64 firm-month characteristics are observed at month t
+- all 64 characteristics enter the hidden expected-return function
 - the target is the excess return earned in month t + 1
-- expected returns are a hidden nonlinear function of the observed
-  characteristics
-- the last 32 characteristics are irrelevant Gaussian-style characteristics,
-  giving a simple GFD-Synthetic-64 analogue
+- expected returns combine linear characteristic levels, nonlinear level
+  transforms, pairwise interactions, and nonlinear pairwise interactions
 
 Outputs are written to:
 
@@ -20,7 +19,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -41,25 +40,101 @@ from Scaling_Law_Estimator import (  # noqa: E402
 )
 
 
-N_MONTHS = 200
-N_FIRMS = 200
-N_SIGNAL_CHARS = 32
-N_NOISE_CHARS = 32
-N_FIRM_CHARS = N_SIGNAL_CHARS + N_NOISE_CHARS
-CHAR_PERSISTENCE = 0.92
-FEATURE_SET = "synthetic_64"  # use "signal_32" to train only on informative chars
-RANDOM_STATE = 42
+N_MONTHS = 200  # More months give longer train/val/test histories.
+N_FIRMS = 200  # More firms give a larger cross-section each month.
+N_FIRM_CHARS = 64  # More characteristics increase input dimension.
+CHAR_PERSISTENCE = 0.92  # Higher values make characteristics move more slowly.
+RANDOM_STATE = 42  # Change this to draw a different simulated economy.
 
-OUTPUT_DIR = Path.home() / "Desktop" / "characteristic next return simulation"
+# Hidden expected-return controls. Set a strength to 0.0 to remove that block.
+LINEAR_CHAR_COUNT = 64  # More linear chars make the signal more additive.
+NONLINEAR_LEVEL_CHAR_COUNT = 64  # More chars here add nonlinear single-char effects.
+PAIRWISE_INTERACTION_COUNT = 256  # More pairs add more char_i * char_j effects.
+NONLINEAR_INTERACTION_COUNT = 256  # More pairs add harder nonlinear interaction effects.
+
+LINEAR_LEVEL_STRENGTH = 0.01  # Higher values make additive effects matter more.
+NONLINEAR_LEVEL_STRENGTH = 0.01  # Higher values make nonlinear levels matter more.
+PAIRWISE_INTERACTION_STRENGTH = 0.02  # Higher values make simple interactions matter more.
+NONLINEAR_INTERACTION_STRENGTH = 0.02  # Higher values make complex interactions matter more.
+
+COMMON_SHOCK_SCALE = 0.01  # Higher values add more month-wide return noise.
+IDIOSYNCRATIC_ERROR_SCALE = 0.05  # Higher values add more firm-level return noise.
+TARGET_MEAN_MONTHLY_RETURN = 0  # Higher values shift average monthly returns up.
+CONDITIONAL_MEAN_CLIP = 0.1  # Lower values cap extreme expected returns more tightly.
+
+OUTPUT_DIR = Path.home() / "Desktop" / "characteristic next return simulation"  # Output location.
+
+
+def normalized_random_weights(rng: np.random.Generator, size: int) -> np.ndarray:
+    """Draw random weights normalized to unit Euclidean length."""
+    if size <= 0:
+        return np.empty(0, dtype=np.float64)
+    weights = rng.normal(size=size)
+    norm = np.linalg.norm(weights)
+    if norm == 0.0:
+        return weights
+    return weights / norm
+
+
+def choose_characteristic_indices(
+        n_firm_chars: int,
+        count: int,
+) -> np.ndarray:
+    """Use the first count characteristics for level effects."""
+    if count < 0 or count > n_firm_chars:
+        raise ValueError(
+            f"Characteristic count must be between 0 and {n_firm_chars}, "
+            f"got {count}"
+        )
+    return np.arange(count)
+
+
+def choose_interaction_pairs(
+        rng: np.random.Generator,
+        n_firm_chars: int,
+        count: int,
+) -> List[Tuple[int, int]]:
+    """Choose random distinct characteristic pairs for interaction blocks."""
+    all_pairs = [
+        (i, j)
+        for i in range(n_firm_chars)
+        for j in range(i + 1, n_firm_chars)
+    ]
+    if count < 0 or count > len(all_pairs):
+        raise ValueError(
+            f"Interaction count must be between 0 and {len(all_pairs)}, "
+            f"got {count}"
+        )
+    if count == 0:
+        return []
+    chosen = rng.choice(len(all_pairs), size=count, replace=False)
+    return [all_pairs[int(idx)] for idx in chosen]
+
+
+def standardize_terms(terms: np.ndarray) -> np.ndarray:
+    """Center and scale each hidden term to make strength controls comparable."""
+    centered = terms - terms.mean(axis=(0, 1), keepdims=True)
+    scale = centered.std(axis=(0, 1), keepdims=True)
+    return centered / np.where(scale > 0.0, scale, 1.0)
 
 
 def simulate_characteristic_next_return_panel(
         n_months: int = N_MONTHS,
         n_firms: int = N_FIRMS,
-        n_signal_chars: int = N_SIGNAL_CHARS,
-        n_noise_chars: int = N_NOISE_CHARS,
+        n_firm_chars: int = N_FIRM_CHARS,
         char_persistence: float = CHAR_PERSISTENCE,
-        feature_set: str = FEATURE_SET,
+        linear_char_count: int = LINEAR_CHAR_COUNT,
+        nonlinear_level_char_count: int = NONLINEAR_LEVEL_CHAR_COUNT,
+        pairwise_interaction_count: int = PAIRWISE_INTERACTION_COUNT,
+        nonlinear_interaction_count: int = NONLINEAR_INTERACTION_COUNT,
+        linear_level_strength: float = LINEAR_LEVEL_STRENGTH,
+        nonlinear_level_strength: float = NONLINEAR_LEVEL_STRENGTH,
+        pairwise_interaction_strength: float = PAIRWISE_INTERACTION_STRENGTH,
+        nonlinear_interaction_strength: float = NONLINEAR_INTERACTION_STRENGTH,
+        common_shock_scale: float = COMMON_SHOCK_SCALE,
+        idiosyncratic_error_scale: float = IDIOSYNCRATIC_ERROR_SCALE,
+        target_mean_monthly_return: float = TARGET_MEAN_MONTHLY_RETURN,
+        conditional_mean_clip: Optional[float] = CONDITIONAL_MEAN_CLIP,
         random_state: int = RANDOM_STATE,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -72,99 +147,165 @@ def simulate_characteristic_next_return_panel(
         A tuple of (panel_dataframe, feature_columns).
     """
     rng = np.random.default_rng(random_state)
-    n_firm_chars = n_signal_chars + n_noise_chars
 
     dates = pd.date_range("2000-01-31", periods=n_months + 1, freq="ME")
     signal_dates = dates[:-1]
     return_dates = dates[1:]
 
-    signal_characteristics = np.empty(
-        (n_months, n_firms, n_signal_chars),
+    if not -1.0 < char_persistence < 1.0:
+        raise ValueError(
+            "char_persistence must be strictly between -1 and 1, "
+            f"got {char_persistence}"
+        )
+
+    characteristics = np.empty(
+        (n_months, n_firms, n_firm_chars),
         dtype=np.float64,
     )
-    signal_characteristics[0] = rng.normal(
+    characteristics[0] = rng.normal(
         loc=0.0,
         scale=1.0,
-        size=(n_firms, n_signal_chars),
+        size=(n_firms, n_firm_chars),
     )
     innovation_scale = np.sqrt(1.0 - char_persistence ** 2)
     for month in range(1, n_months):
-        signal_characteristics[month] = (
-            char_persistence * signal_characteristics[month - 1]
-            + innovation_scale * rng.normal(size=(n_firms, n_signal_chars))
+        characteristics[month] = (
+            char_persistence * characteristics[month - 1]
+            + innovation_scale * rng.normal(size=(n_firms, n_firm_chars))
         )
 
-    noise_characteristics = rng.normal(
-        loc=0.0,
-        scale=1.0,
-        size=(n_months, n_firms, n_noise_chars),
-    )
-    characteristics = np.concatenate(
-        [signal_characteristics, noise_characteristics],
-        axis=2,
-    )
-    signal_chars = signal_characteristics
+    zero_component = np.zeros((n_months, n_firms), dtype=np.float64)
 
-    linear_weights = rng.normal(size=n_signal_chars)
-    linear_weights /= np.linalg.norm(linear_weights)
+    linear_indices = choose_characteristic_indices(
+        n_firm_chars,
+        linear_char_count,
+    )
+    if linear_level_strength != 0.0 and len(linear_indices) > 0:
+        linear_terms = standardize_terms(characteristics[:, :, linear_indices])
+        linear_weights = normalized_random_weights(rng, linear_terms.shape[2])
+        linear_component = linear_level_strength * np.tensordot(
+            linear_terms,
+            linear_weights,
+            axes=([2], [0]),
+        )
+    else:
+        linear_component = zero_component.copy()
 
-    quad_count = min(8, n_signal_chars)
-    quadratic_weights = rng.normal(size=quad_count)
-    quadratic_weights /= np.linalg.norm(quadratic_weights)
+    nonlinear_level_indices = choose_characteristic_indices(
+        n_firm_chars,
+        nonlinear_level_char_count,
+    )
+    if nonlinear_level_strength != 0.0 and len(nonlinear_level_indices) > 0:
+        level_chars = characteristics[:, :, nonlinear_level_indices]
+        nonlinear_level_terms = np.concatenate(
+            [
+                np.sin(1.3 * level_chars),
+                np.tanh(level_chars),
+                level_chars ** 2,
+                level_chars ** 3 / (1.0 + level_chars ** 2),
+            ],
+            axis=2,
+        )
+        nonlinear_level_terms = standardize_terms(nonlinear_level_terms)
+        nonlinear_level_weights = normalized_random_weights(
+            rng,
+            nonlinear_level_terms.shape[2],
+        )
+        nonlinear_level_component = nonlinear_level_strength * np.tensordot(
+            nonlinear_level_terms,
+            nonlinear_level_weights,
+            axes=([2], [0]),
+        )
+    else:
+        nonlinear_level_component = zero_component.copy()
 
-    interaction_pairs = [
-        (0, 1),
-        (2, 3),
-        (4, 5),
-        (6, 7),
-        (8, 9),
-        (10, 11),
-        (12, 13),
-        (14, 15),
-    ]
-    interaction_pairs = [
-        (i, j) for i, j in interaction_pairs
-        if i < n_signal_chars and j < n_signal_chars
-    ]
-    interaction_weights = rng.normal(size=len(interaction_pairs))
-    interaction_weights /= np.linalg.norm(interaction_weights)
+    interaction_pairs = choose_interaction_pairs(
+        rng,
+        n_firm_chars,
+        pairwise_interaction_count,
+    )
+    if pairwise_interaction_strength != 0.0 and interaction_pairs:
+        pair_i = np.array([i for i, _ in interaction_pairs])
+        pair_j = np.array([j for _, j in interaction_pairs])
+        interaction_terms = (
+            characteristics[:, :, pair_i] * characteristics[:, :, pair_j]
+        )
+        interaction_terms = standardize_terms(interaction_terms)
+        interaction_weights = normalized_random_weights(
+            rng,
+            interaction_terms.shape[2],
+        )
+        interaction_component = pairwise_interaction_strength * np.tensordot(
+            interaction_terms,
+            interaction_weights,
+            axes=([2], [0]),
+        )
+    else:
+        interaction_component = zero_component.copy()
 
-    linear_component = 0.012 * np.tensordot(
-        signal_chars,
-        linear_weights,
-        axes=([2], [0]),
+    nonlinear_interaction_pairs = choose_interaction_pairs(
+        rng,
+        n_firm_chars,
+        nonlinear_interaction_count,
     )
-    quadratic_component = 0.006 * np.tensordot(
-        signal_chars[:, :, :quad_count] ** 2 - 1.0,
-        quadratic_weights,
-        axes=([2], [0]),
-    )
-    interaction_terms = np.stack([
-        signal_chars[:, :, i] * signal_chars[:, :, j]
-        for i, j in interaction_pairs
-    ], axis=2)
-    interaction_component = 0.008 * np.tensordot(
-        interaction_terms,
-        interaction_weights,
-        axes=([2], [0]),
-    )
-    smooth_component = (
-        0.004 * np.sin(signal_chars[:, :, 0])
-        - 0.003 * np.tanh(signal_chars[:, :, 1] * signal_chars[:, :, 2])
-        + 0.003 * np.cos(signal_chars[:, :, 3])
-    )
+    if nonlinear_interaction_strength != 0.0 and nonlinear_interaction_pairs:
+        pair_i = np.array([i for i, _ in nonlinear_interaction_pairs])
+        pair_j = np.array([j for _, j in nonlinear_interaction_pairs])
+        left = characteristics[:, :, pair_i]
+        right = characteristics[:, :, pair_j]
+        nonlinear_interaction_terms = np.concatenate(
+            [
+                np.tanh(left * right),
+                np.sin(left + right),
+                np.tanh(left ** 2 - right ** 2),
+                (left * right) / (1.0 + np.abs(left - right)),
+            ],
+            axis=2,
+        )
+        nonlinear_interaction_terms = standardize_terms(
+            nonlinear_interaction_terms
+        )
+        nonlinear_interaction_weights = normalized_random_weights(
+            rng,
+            nonlinear_interaction_terms.shape[2],
+        )
+        nonlinear_interaction_component = (
+            nonlinear_interaction_strength
+            * np.tensordot(
+                nonlinear_interaction_terms,
+                nonlinear_interaction_weights,
+                axes=([2], [0]),
+            )
+        )
+    else:
+        nonlinear_interaction_component = zero_component.copy()
 
     conditional_mean = (
         linear_component
-        + quadratic_component
+        + nonlinear_level_component
         + interaction_component
-        + smooth_component
+        + nonlinear_interaction_component
     )
+    conditional_mean = (
+        conditional_mean
+        - conditional_mean.mean()
+        + target_mean_monthly_return
+    )
+    if conditional_mean_clip is not None and conditional_mean_clip > 0.0:
+        conditional_mean = np.clip(
+            conditional_mean,
+            -conditional_mean_clip,
+            conditional_mean_clip,
+        )
 
-    next_month_common_shock = rng.normal(loc=0.0, scale=0.010, size=n_months)
+    next_month_common_shock = rng.normal(
+        loc=0.0,
+        scale=common_shock_scale,
+        size=n_months,
+    )
     idiosyncratic_error = rng.normal(
         loc=0.0,
-        scale=0.045,
+        scale=idiosyncratic_error_scale,
         size=(n_months, n_firms),
     )
     excess_return = (
@@ -199,22 +340,14 @@ def simulate_characteristic_next_return_panel(
         char_cols.append(col)
 
     df = pd.DataFrame(data)
-
-    if feature_set == "signal_32":
-        feature_cols = char_cols[:n_signal_chars]
-    elif feature_set == "synthetic_64":
-        feature_cols = char_cols
-    else:
-        raise ValueError(
-            "feature_set must be either 'signal_32' or 'synthetic_64', "
-            f"got {feature_set!r}"
-        )
+    feature_cols = char_cols
 
     return df, feature_cols
 
 
 def get_epochs(size: int) -> int:
-    return max(int((0.1 * (size ** 0.75))), 1) + 100
+    #return max(int((0.1 * (size ** 0.75))), 1) + 100
+    return max(int((0.50 * (size ** 0.60))), 1) + 100
 
 
 def resolve_split_cutoffs(
@@ -253,26 +386,27 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         normalization=NormalizationType.LAYER,
         architecture_mode=ArchitectureMode.FIXED_DEPTH,
         fixed_depth_layers=5,
-        dropout_rate=0.1,
+        dropout_rate=0.2,
         dropout_middle_only=True,
         initializer=InitializerType.HE_NORMAL,
         use_input_normalization=True,
         param_sizes=[
+            "500",
             "1K",
             "5K",
             "10K",
             "20K",
-            # "50K",
-            # "100K",
-            # "500K",
-            # "1M"
+            "50K",
+            #"100K",
+            #"500K",
+            #"1M"
         ],
         epochs=get_epochs,
         batch_size=65536,
         prediction_batch_size=65536,
-        learning_rate=0.1,
+        learning_rate=0.01,
         clip_norm=1.0,
-        lr_scheduler_enabled=True,
+        lr_scheduler_enabled=False,
         lr_scheduler_factor=0.5,
         lr_scheduler_patience=None,
         lr_scheduler_min_lr=1e-10,
@@ -304,9 +438,18 @@ def main() -> None:
     print(f"Signal months: {N_MONTHS:,}")
     print(f"Firms: {N_FIRMS:,}")
     print(f"Observations: {N_MONTHS * N_FIRMS:,}")
-    print(f"Informative characteristics: {N_SIGNAL_CHARS:,}")
-    print(f"Irrelevant characteristics: {N_NOISE_CHARS:,}")
-    print(f"Feature set: {FEATURE_SET}")
+    print(f"Firm characteristics: {N_FIRM_CHARS:,}")
+    print(f"Linear characteristic levels: {LINEAR_CHAR_COUNT:,}")
+    print(f"Nonlinear level transforms: {NONLINEAR_LEVEL_CHAR_COUNT:,}")
+    print(f"Pairwise interactions: {PAIRWISE_INTERACTION_COUNT:,}")
+    print(f"Nonlinear interactions: {NONLINEAR_INTERACTION_COUNT:,}")
+    print(
+        "Strengths: "
+        f"linear={LINEAR_LEVEL_STRENGTH:.4f}, "
+        f"nonlinear_levels={NONLINEAR_LEVEL_STRENGTH:.4f}, "
+        f"interactions={PAIRWISE_INTERACTION_STRENGTH:.4f}, "
+        f"nonlinear_interactions={NONLINEAR_INTERACTION_STRENGTH:.4f}"
+    )
     print("Timing: characteristics at month t predict ret_exc earned in month t + 1")
 
     df, feature_cols = simulate_characteristic_next_return_panel()
