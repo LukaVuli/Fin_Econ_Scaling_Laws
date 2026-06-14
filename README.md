@@ -1,4 +1,4 @@
-# Fin_Econ_Scaling_Laws
+# Financial Economics Scaling Laws
 
 Financial Economics Scaling Laws is a Python package for estimating scaling laws in
 economics and finance forecasting problems.
