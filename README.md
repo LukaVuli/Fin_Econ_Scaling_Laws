@@ -1,205 +1,303 @@
-# Scaling Law Estimator
+# Fin_Econ_Scaling_Laws
 
-A configurable TensorFlow/Keras experiment runner for neural-network scaling-law
-studies. The estimator trains the same model family at many target parameter
-counts, records validation/test performance, estimates compute in PF-days, and
-optionally evaluates portfolio strategies from model forecasts.
+Financial Economics Scaling Laws is a Python package for estimating scaling laws in
+economics and finance forecasting problems.
 
-This repository currently ships the estimator as one Python module:
+The package lets researchers train neural networks across many model sizes, record
+forecast accuracy and compute, and fit empirical power-law relationships between
+compute/model scale and predictive performance. It was built from the methods in
+Timmermann and Vulicevic (2026). It is a methods
+package meant to help other researchers apply, modify, and extend scaling-law tools
+on their own time-series, panel, and return-predictability data.
+
+The PyPI/project name is `Fin_Econ_Scaling_Laws`. The Python import module is
+`scaling_laws`:
+
+```python
+from scaling_laws import ScalingLawConfig, ScalingLawExperiment
+```
+
+## Overview
+
+Scaling laws describe how forecast performance changes as computational scale
+increases. In this package, compute is tracked during model training and related to
+out-of-sample performance using power-law curves. The same workflow can be used to
+study:
+
+1. How forecast loss changes with model scale and training compute.
+2. Whether performance appears to approach an asymptotic limit.
+3. How economic measures such as portfolio Sharpe ratios scale with compute.
+4. Whether richer predictor sets improve the attainable performance frontier.
+5. How much compute is required before larger models or larger datasets become useful.
+
+The package is designed for researchers who want to estimate these relationships on
+their own economics or finance data, not only on the data used in the paper.
+
+## Authors
+
+- [Allan Timmermann](https://rady.ucsd.edu/faculty-research/faculty/allan-timmermann.html)
+- [Luka Vulicevic](https://www.lukavulicevic.com/)
+
+## Academic Paper
+
+The methods are based on:
+
+**Compute, Complexity, and the Scaling Laws of Return Predictability**
+
+Allan Timmermann and Luka Vulicevic
+SSRN: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6105327
+
+If you use this package or the methodology in academic work, please cite:
+
+```bibtex
+@article{timmermann2026compute,
+  title={Compute, Complexity, and the Scaling Laws of Return Predictability},
+  author={Timmermann, Allan and Vulicevic, Luka},
+  journal={Available at SSRN 6105327},
+  year={2026}
+}
+```
+
+## Key Features
+
+### Estimate scaling laws from forecasting experiments
+
+Train the same model family across a grid of target parameter counts, save
+out-of-sample performance, and fit scaling-law plots against cumulative training
+compute.
+
+
+### Flexible model-size grids
+
+Parameter grids can be supplied directly, for example `["250", "1K", "10K",
+"100K", "1M"]`, or generated programmatically with
+`ScalingLawExperiment.make_param_sizes(...)`.
+
+### Portfolio evaluation
+
+When test dates are supplied, predictions can be evaluated as:
+
+1. **Panel portfolios**: cross-sectional sorts by predicted returns, including
+   decile returns, forecast-weighted returns, and long-short portfolios.
+2. **Time-series strategies**: forecast-timed strategy returns using configurable
+   risk scaling, lags, weights, and trading constraints.
+
+### Plotting tools
+
+After a run, create standard scaling-law figures for losses, R2, and portfolio
+performance with `experiment.create_plots(...)`.
+
+### Simulation example
+
+The repository includes a simulation script that creates synthetic firm-month
+characteristics and next-month returns, then runs the package on the simulated
+panel. This is meant to show how to work with the methodology before applying it
+to real data.
+
+## Project Structure
 
 ```text
-Scaling_Law_Estimator.py
+Fin_Econ_Scaling_Laws/
+|-- README.md
+|-- LICENSE
+|-- requirements.txt
+|-- pyproject.toml
+|-- llms.txt
+|-- Testing/
+|   `-- simulation_example.py
+`-- scaling_laws/
+    |-- __init__.py
+    |-- config.py
+    |-- experiment.py
+    |-- model_builder.py
+    |-- data_splitter.py
+    |-- portfolio.py
+    |-- plotting.py
+    |-- results.py
+    |-- callbacks.py
+    |-- enums.py
+    `-- utils/
+        |-- format.py
+        |-- memory.py
+        `-- system.py
 ```
 
-When published as a package, the examples below can use the package import.
-Until then, run the examples from this folder and import directly from
-`Scaling_Law_Estimator`.
+## Installation & Requirements
 
-## What The Code Does
+### From PyPI
 
-At a high level, the estimator:
-
-1. Builds dense neural networks at requested parameter counts.
-2. Trains each network on train/validation/test data.
-3. Saves results incrementally, so long experiments can resume safely.
-4. Tracks training curves, final losses, R2, wall-clock time, and compute.
-5. Optionally converts predictions into panel or time-series portfolio returns.
-6. Fits and plots scaling-law curves from saved experiment outputs.
-
-The main public classes are:
-
-```python
-ScalingLawConfig       # all experiment configuration
-ScalingLawExperiment   # train models and save results
-ScalingLawPlotter      # load saved results and make plots
-PortfolioAnalyzer      # standalone portfolio analysis helpers
-DataSplitter           # dataframe split and missing-data logic
-ResultsManager         # output artifact persistence
-```
-
-## Installation
-
-For a future published package:
+Install the package with:
 
 ```bash
-pip install scaling-law-estimator
+pip install Fin_Econ_Scaling_Laws
 ```
 
-For the current single-file repository, install the scientific dependencies and
-run scripts from this directory:
+### From this repository
+
+For local development:
 
 ```bash
-pip install tensorflow numpy pandas scipy matplotlib psutil
+pip install -e .
 ```
 
-`psutil` is optional. It is only used for memory diagnostics.
+To install the full runtime stack listed in this repository:
 
-## Imports
+```bash
+pip install -r requirements.txt
+```
 
-Use this import style in the current folder:
+### Core dependencies
+
+```text
+tensorflow
+numpy
+pandas
+scipy
+matplotlib
+```
+
+The requirements file includes `tensorflow-metal` for Apple Silicon Macs through
+a platform marker. Optional memory diagnostics use `psutil`.
+
+## Package Imports
+
+Most users start with:
 
 ```python
-from Scaling_Law_Estimator import (
+from scaling_laws import (
     ScalingLawConfig,
     ScalingLawExperiment,
-    ScalingLawPlotter,
-    NormalizationType,
-    ArchitectureMode,
-    InitializerType,
+    TrainingConfig,
+    SplitConfig,
+    OutputConfig,
+    RuntimeConfig,
     ResumeMode,
-    SplitMode,
+)
+```
+
+Additional configuration classes and enums are also exported from `scaling_laws`,
+including:
+
+```python
+from scaling_laws import (
+    ArchitectureConfig,
+    ArchitectureMode,
+    AnnualizationConfig,
+    BenchmarkConfig,
+    ComputeConfig,
+    FuzzyStopConfig,
+    InitializerType,
+    MissingDataConfig,
     MissingDataPolicy,
+    NormalizationType,
+    PortfolioConfig,
+    PortfolioMode,
+    PreSplitData,
+    SchedulerConfig,
+    TradingConfig,
+    TSStrategyConfig,
+    format_params,
+    parse_size,
+    print_system_info,
 )
 ```
 
-After packaging, the same API should be exported by the package:
+For direct plotting from saved results:
 
 ```python
-from scaling_law_estimator import ScalingLawConfig, ScalingLawExperiment
+from scaling_laws.plotting import ScalingLawPlotter
 ```
 
-## Simplest Possible Run
+## Data Requirements
 
-The lowest-friction path is to pass already-split NumPy arrays.
+The standard DataFrame workflow expects:
 
-```python
-import numpy as np
+- A date column, such as `date`
+- One or more feature columns observed at time `t`
+- A target column observed at the forecast horizon, such as `ret_exc`
+- Optionally, an asset identifier column, such as `permno`, for panel portfolio
+  accounting
 
-from Scaling_Law_Estimator import ScalingLawConfig, ScalingLawExperiment
-
-rng = np.random.default_rng(42)
-
-X_train = rng.normal(size=(1000, 20)).astype("float32")
-y_train = rng.normal(size=1000).astype("float32")
-
-X_val = rng.normal(size=(200, 20)).astype("float32")
-y_val = rng.normal(size=200).astype("float32")
-
-X_test = rng.normal(size=(200, 20)).astype("float32")
-y_test = rng.normal(size=200).astype("float32")
-
-config = ScalingLawConfig(
-    param_sizes=["1K", "10K"],
-    epochs=5,
-    output_dir="./Output/quickstart",
-    resume=False,
-    save_models=False,
-)
-
-experiment = ScalingLawExperiment(config)
-results = experiment.run(
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    X_test,
-    y_test,
-)
-
-print(results)
-```
-
-This creates:
+For example:
 
 ```text
-./Output/quickstart/
-  scaling_results.pkl
-  scaling_results.json
+date        permno   char_01   char_02   ...   ret_exc
+2000-01-31  10001   0.421    -0.038          0.014
+2000-01-31  10002  -0.107     0.552         -0.021
+2000-02-29  10001   0.390     0.012          0.008
 ```
 
-If portfolio analysis is enabled and dates are supplied, it also creates:
+The package does not require stock returns specifically. The same structure can
+be used for other economics or finance forecasting problems where predictors are
+observed before the target.
 
-```text
-portfolio_returns.csv
-```
+## Usage
 
-## Simplest DataFrame Run
+### 1. Minimal DataFrame Workflow
 
-For most research workflows, you will have a single DataFrame with feature
-columns, a target column, and a date column. The estimator can split it for you
-without look-ahead leakage.
+Use `ScalingLawExperiment.run(...)` when your data are in a single DataFrame.
 
 ```python
 import numpy as np
 import pandas as pd
 
-from Scaling_Law_Estimator import ScalingLawConfig, ScalingLawExperiment
+from scaling_laws import (
+    OutputConfig,
+    ResumeMode,
+    RuntimeConfig,
+    ScalingLawConfig,
+    ScalingLawExperiment,
+    SplitConfig,
+    TrainingConfig,
+)
 
 rng = np.random.default_rng(42)
-n = 5000
+n = 2_000
 
 df = pd.DataFrame({
-    "date": pd.date_range("2000-01-01", periods=n, freq="D"),
+    "date": pd.date_range("2000-01-31", periods=n, freq="D"),
     "x1": rng.normal(size=n),
     "x2": rng.normal(size=n),
     "x3": rng.normal(size=n),
-    "target": rng.normal(size=n),
+    "ret_exc": rng.normal(scale=0.05, size=n),
 })
 
 config = ScalingLawConfig(
-    param_sizes=["1K", "10K", "100K"],
-    epochs=10,
-    test_size=0.2,
-    val_size=0.125,
-    output_dir="./Output/dataframe_run",
-    resume=False,
+    training=TrainingConfig(epochs=5, train_batch_size=512),
+    split=SplitConfig(test_size=0.20, val_size=0.125),
+    output=OutputConfig(output_dir="./Output/readme_dataframe"),
+    runtime=RuntimeConfig(resume=ResumeMode.OVERWRITE, random_state=42),
+    param_sizes=["1K", "10K"],
 )
 
 experiment = ScalingLawExperiment(config)
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2", "x3"],
-    target_col="target",
+results = experiment.run(
+    df,
+    X=["x1", "x2", "x3"],
+    y="ret_exc",
     date_col="date",
 )
 ```
 
 With numeric `test_size` and `val_size`, splitting is done by unique dates, not
-by individual rows. That preserves the time ordering.
+by individual rows.
 
-## Date Cutoff Splits
+### 2. Exact Date Cutoffs
 
-Use string cutoffs when you want exact time periods:
+Use string cutoffs when you want fixed sample periods.
 
 ```python
 config = ScalingLawConfig(
-    test_size="2020-01-01",
-    val_size="2018-01-01",
+    split=SplitConfig(
+        val_size="2018-01-01",
+        test_size="2020-01-01",
+    ),
+    output=OutputConfig(output_dir="./Output/date_cutoffs"),
     param_sizes=["10K", "100K"],
-    epochs=20,
-    output_dir="./Output/date_cutoffs",
-)
-
-experiment = ScalingLawExperiment(config)
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2", "x3"],
-    target_col="target",
-    date_col="date",
 )
 ```
 
-This means:
+This creates:
 
 ```text
 train: date < 2018-01-01
@@ -207,45 +305,166 @@ val:   2018-01-01 <= date < 2020-01-01
 test:  date >= 2020-01-01
 ```
 
-## Configuration Styles
+### 3. Pre-Split Arrays
 
-The package supports two styles.
-
-### Flat Compatibility Style
-
-This matches the older script API and is still fully supported:
+Use `run_from_arrays(...)` when your own pipeline already created the train,
+validation, and test arrays.
 
 ```python
+import numpy as np
+
+from scaling_laws import (
+    OutputConfig,
+    ResumeMode,
+    RuntimeConfig,
+    ScalingLawConfig,
+    ScalingLawExperiment,
+    TrainingConfig,
+)
+
+rng = np.random.default_rng(42)
+
+X_train = rng.normal(size=(1_000, 20)).astype("float32")
+y_train = rng.normal(size=1_000).astype("float32")
+X_val = rng.normal(size=(250, 20)).astype("float32")
+y_val = rng.normal(size=250).astype("float32")
+X_test = rng.normal(size=(250, 20)).astype("float32")
+y_test = rng.normal(size=250).astype("float32")
+
 config = ScalingLawConfig(
-    normalization="layer",
-    architecture_mode="fixed_depth",
-    fixed_depth_layers=5,
-    dropout_rate=0.2,
-    epochs=100,
-    batch_size=65536,
-    learning_rate=0.001,
-    test_size="1994-12-01",
-    val_size="1992-12-01",
-    output_dir="./Output/gfd",
-    resume=True,
-    random_state=42,
+    training=TrainingConfig(epochs=5, train_batch_size=512),
+    output=OutputConfig(output_dir="./Output/readme_arrays"),
+    runtime=RuntimeConfig(resume=ResumeMode.OVERWRITE),
+    param_sizes=["1K", "10K"],
+)
+
+experiment = ScalingLawExperiment(config)
+results = experiment.run_from_arrays(
+    X_train=X_train,
+    y_train=y_train,
+    X_val=X_val,
+    y_val=y_val,
+    X_test=X_test,
+    y_test=y_test,
 )
 ```
 
-### Nested Package Style
+For portfolio analysis from arrays, also pass `test_dates`. For panel portfolio
+analysis, pass `asset_ids`.
 
-This is better for package users because each concern has its own config object:
+### 4. Panel Portfolio Evaluation
+
+Panel mode sorts cross-sectional predictions within each date.
 
 ```python
-from Scaling_Law_Estimator import (
-    ScalingLawConfig,
+from scaling_laws import AnnualizationConfig, PortfolioConfig, ScalingLawConfig
+
+config = ScalingLawConfig(
+    portfolio=PortfolioConfig(mode="panel", asset_id_col="permno"),
+    annualization=AnnualizationConfig(periods=12),
+)
+
+results = experiment.run(
+    df,
+    X=feature_cols,
+    y="ret_exc",
+    date_col="date",
+    portfolio="panel",
+    asset_id_col="permno",
+)
+```
+
+### 5. Time-Series Strategy Evaluation
+
+Time-series mode treats model predictions as a strategy signal for one return
+series or aggregate portfolio.
+
+```python
+from scaling_laws import PortfolioConfig, ScalingLawConfig, TSStrategyConfig
+
+config = ScalingLawConfig(
+    portfolio=PortfolioConfig(mode="ts"),
+    ts_strategy=TSStrategyConfig(
+        kappa=1.0,
+        min_periods=6,
+        signal_lag=1,
+        standardize_signal=False,
+    ),
+)
+
+results = experiment.run(
+    df,
+    X=feature_cols,
+    y="ret_exc",
+    date_col="date",
+    portfolio="ts",
+    kappa=0.5,
+)
+```
+
+### 6. Plot Results
+
+After an experiment finishes:
+
+```python
+experiment.create_plots(dpi=300)
+```
+
+To include panel long-short breakpoints:
+
+```python
+experiment.create_plots(dpi=300, include_ls_breakpoints=True)
+```
+
+To plot directly from a saved output directory:
+
+```python
+from scaling_laws.plotting import ScalingLawPlotter
+
+plotter = ScalingLawPlotter("./Output/readme_dataframe")
+plotter.create_all_plots(dpi=300)
+```
+
+## Configuration Parameters
+
+`ScalingLawConfig` is the top-level configuration object. It nests smaller
+configuration objects so researchers can change one part of the workflow without
+rewriting the others.
+
+### Common controls
+
+- **`param_sizes`**: model-size grid, e.g. `["1K", "10K", "100K", "1M"]`
+- **`start_at_size` / `stop_at_size`**: run only part of the size grid
+- **`TrainingConfig.epochs`**: fixed integer or callable schedule by parameter count
+- **`TrainingConfig.train_batch_size`**: training batch size
+- **`TrainingConfig.learning_rate`**: optimizer learning rate
+- **`SplitConfig.test_size` / `val_size`**: date proportions or date cutoffs
+- **`OutputConfig.output_dir`**: directory for saved outputs
+- **`RuntimeConfig.resume`**: behavior when outputs already exist
+- **`ComputeConfig.precision`**: numeric precision policy
+- **`PortfolioConfig.mode`**: `"panel"` or `"ts"`
+
+### Example full configuration
+
+```python
+from scaling_laws import (
     ArchitectureConfig,
-    TrainingConfig,
-    SplitConfig,
-    OutputConfig,
-    RuntimeConfig,
     ArchitectureMode,
+    AnnualizationConfig,
+    BenchmarkConfig,
+    ComputeConfig,
+    FuzzyStopConfig,
+    InitializerType,
     NormalizationType,
+    OutputConfig,
+    PortfolioConfig,
+    ResumeMode,
+    RuntimeConfig,
+    ScalingLawConfig,
+    SchedulerConfig,
+    SplitConfig,
+    TrainingConfig,
+    TSStrategyConfig,
 )
 
 config = ScalingLawConfig(
@@ -253,874 +472,247 @@ config = ScalingLawConfig(
         normalization=NormalizationType.LAYER,
         architecture_mode=ArchitectureMode.FIXED_DEPTH,
         fixed_depth_layers=5,
-        dropout_rate=0.2,
+        dropout_rate=0.10,
+        dropout_middle_only=True,
+        initializer=InitializerType.HE_NORMAL,
+        use_input_normalization=True,
     ),
     training=TrainingConfig(
         epochs=100,
-        train_batch_size=65536,
-        prediction_batch_size=262144,
+        train_batch_size=65_536,
+        validation_batch_size=None,
+        prediction_batch_size=262_144,
         learning_rate=0.001,
+        optimizer="adam",
+        clip_norm=1.0,
     ),
+    scheduler=SchedulerConfig(
+        lr_scheduler_enabled=True,
+        lr_scheduler_factor=0.5,
+        lr_scheduler_patience=None,
+        lr_scheduler_min_lr=1e-10,
+    ),
+    fuzzy_stop=FuzzyStopConfig(enabled=False),
     split=SplitConfig(
-        test_size="1994-12-01",
-        val_size="1992-12-01",
+        val_size="2018-01-01",
+        test_size="2020-01-01",
     ),
     output=OutputConfig(
-        output_dir="./Output/gfd",
-        save_models=True,
+        output_dir="./Output/main_run",
+        save_pickle=True,
+        save_json=True,
+        save_csv=True,
+        save_models=False,
     ),
     runtime=RuntimeConfig(
-        resume=True,
+        resume=ResumeMode.UPDATE_EXISTING,
         random_state=42,
+        show_live_plots=False,
+        debug_memory=False,
     ),
+    compute=ComputeConfig(
+        precision=32,
+        enable_determinism=True,
+    ),
+    benchmark=BenchmarkConfig(mode="historical_mean"),
+    annualization=AnnualizationConfig(periods=12),
+    ts_strategy=TSStrategyConfig(kappa=1.0),
+    portfolio=PortfolioConfig(mode="panel", asset_id_col="permno"),
+    param_sizes=["1K", "10K", "100K", "1M"],
 )
 ```
 
-Nested configs may also be passed as dictionaries:
+Nested configuration fields can also be passed as dictionaries:
 
 ```python
 config = ScalingLawConfig(
-    architecture={
-        "architecture_mode": "fixed_depth",
-        "fixed_depth_layers": 3,
-        "normalization": "batch",
-    },
     training={
         "epochs": 50,
-        "train_batch_size": 8192,
+        "train_batch_size": 8_192,
     },
     output={
         "output_dir": "./Output/dict_config",
     },
+    runtime={
+        "resume": "overwrite",
+    },
+    param_sizes=["1K", "10K"],
 )
 ```
 
 ## Parameter Sizes
 
-Parameter sizes can be strings or generated programmatically.
+Parameter sizes can be strings or integers:
 
 ```python
-config = ScalingLawConfig(
-    param_sizes=["100", "1K", "10K", "100K", "1M"],
-    epochs=50,
-)
-```
+from scaling_laws import ScalingLawExperiment, format_params, parse_size
 
-Useful helpers:
-
-```python
-from Scaling_Law_Estimator import ScalingLawExperiment
-
-print(ScalingLawExperiment.parse_size("10K"))       # 10000
-print(ScalingLawExperiment.parse_size("1.5M"))      # 1500000
-print(ScalingLawExperiment.format_params(1000000))  # 1M
+print(parse_size("10K"))          # 10000
+print(parse_size("1.5M"))         # 1500000
+print(format_params(1_000_000))   # 1M
 
 sizes = ScalingLawExperiment.make_param_sizes(
-    jump=50,
-    min_size=100,
+    min_size=1_000,
     max_size=1_000_000,
+    num=8,
 )
 ```
 
-You can also train only part of a size grid:
+Size-dependent epoch schedules are supported:
 
 ```python
-config = ScalingLawConfig(
-    param_sizes=ScalingLawExperiment.make_param_sizes(jump=50),
-    start_at_size="10K",
-    stop_at_size="1M",
-)
-```
-
-## Size-Dependent Epochs
-
-`epochs` can be an integer or a callable that receives the target parameter
-count.
-
-```python
-def get_epochs(size: int) -> int:
-    return max(int(0.1 * (size ** 0.75)), 1) + 10
+def epochs_for_size(size: int) -> int:
+    return max(int(0.1 * size ** 0.75), 1) + 10
 
 config = ScalingLawConfig(
-    param_sizes=["1K", "10K", "100K", "1M"],
-    epochs=get_epochs,
+    training=TrainingConfig(epochs=epochs_for_size),
+    param_sizes=["1K", "10K", "100K"],
 )
 ```
-
-## Architecture Options
-
-The estimator has two built-in architecture modes.
-
-### Tapered
-
-Tapered mode changes depth/width patterns as target parameter counts grow.
-
-```python
-config = ScalingLawConfig(
-    architecture_mode="tapered",
-    param_sizes=["1K", "10K", "100K", "1M"],
-)
-```
-
-### Fixed Depth
-
-Fixed-depth mode solves for an approximately uniform hidden width at a fixed
-number of layers.
-
-```python
-config = ScalingLawConfig(
-    architecture_mode="fixed_depth",
-    fixed_depth_layers=5,
-    param_sizes=["10K", "100K", "1M"],
-)
-```
-
-Normalization and dropout:
-
-```python
-config = ScalingLawConfig(
-    normalization="layer",        # "layer", "batch", or "none"
-    dropout_rate=0.1,
-    dropout_middle_only=True,
-    initializer="he_normal",      # "he_normal" or "glorot_uniform"
-    use_input_normalization=True,
-)
-```
-
-## Training Options
-
-Common training controls:
-
-```python
-config = ScalingLawConfig(
-    epochs=500,
-    batch_size=8192,              # legacy alias for train_batch_size
-    learning_rate=0.001,
-    optimizer="adam",
-    clip_norm=1.0,
-)
-```
-
-Package-style training config:
-
-```python
-from Scaling_Law_Estimator import TrainingConfig
-
-config = ScalingLawConfig(
-    training=TrainingConfig(
-        epochs=100,
-        train_batch_size=65536,
-        validation_batch_size=None,
-        prediction_batch_size=262144,
-        learning_rate=0.001,
-        clip_norm=1.0,
-    )
-)
-```
-
-Learning-rate scheduler:
-
-```python
-config = ScalingLawConfig(
-    lr_scheduler_enabled=True,
-    lr_scheduler_factor=0.5,
-    lr_scheduler_patience=None,   # defaults to max(epochs // 5, 50)
-    lr_scheduler_min_lr=1e-10,
-)
-```
-
-## Runtime And Reproducibility
-
-```python
-config = ScalingLawConfig(
-    random_state=42,
-    enable_determinism=True,
-    precision=32,
-    debug_memory=False,
-    show_live_plots=False,
-)
-```
-
-Seeds are used for NumPy, TensorFlow, initializers, and dropout layer seeds. By
-default, per-layer seeds are `random_state + layer_index`, preserving the old
-default behavior of `42 + layer_index`.
 
 ## Resume Modes
 
-Long scaling experiments are often interrupted. Resume behavior is explicit.
-
-```python
-from Scaling_Law_Estimator import ResumeMode
-
-config = ScalingLawConfig(
-    output_dir="./Output/resume_demo",
-    resume=ResumeMode.UPDATE_EXISTING,
-)
-```
-
-Available modes:
+Long scaling-law experiments can be interrupted. Resume behavior is controlled
+with `RuntimeConfig.resume`.
 
 ```text
-UPDATE_EXISTING  current old resume=True behavior; retrain and upsert results
-OVERWRITE        current old resume=False behavior; reset result artifacts
-SKIP_EXISTING    skip any model_name already present in saved results
-FAIL_IF_EXISTS   raise if result artifacts already contain data
-```
-
-Legacy booleans still work:
-
-```python
-ScalingLawConfig(resume=True)   # UPDATE_EXISTING
-ScalingLawConfig(resume=False)  # OVERWRITE
-```
-
-## Output Artifacts
-
-Default output files:
-
-```text
-scaling_results.pkl
-scaling_results.json
-portfolio_returns.csv
-test_sample.csv
-Models/
-```
-
-Customize artifact names:
-
-```python
-from Scaling_Law_Estimator import ArtifactNames, OutputConfig
-
-config = ScalingLawConfig(
-    output=OutputConfig(
-        output_dir="./Output/custom_names",
-        save_pickle=True,
-        save_json=True,
-        save_csv=True,
-        save_models=True,
-        artifacts=ArtifactNames(
-            results_pickle="results.pkl",
-            results_json="results.json",
-            portfolio_returns_csv="returns.csv",
-            test_sample_csv="test_rows.csv",
-            models_dir="keras_models",
-        ),
-    )
-)
-```
-
-## Missing Data
-
-Default behavior is `drop_any`, which matches the original script: rows are
-dropped if any required feature, target, or date value is missing.
-
-```python
-from Scaling_Law_Estimator import MissingDataConfig
-
-config = ScalingLawConfig(
-    missing_data=MissingDataConfig(policy="drop_any")
-)
-```
-
-Other policies:
-
-```python
-# Drop rows only when target/date is missing. Feature NaNs remain.
-config = ScalingLawConfig(
-    missing_data={"policy": "drop_target_only"}
-)
-
-# Raise if any required model column has missing values.
-config = ScalingLawConfig(
-    missing_data={"policy": "error"}
-)
-
-# Drop target/date NaNs, then fill feature NaNs with feature means.
-config = ScalingLawConfig(
-    missing_data={"policy": "impute_mean"}
-)
-```
-
-## Explicit Mask Splits
-
-Masks must align with the original DataFrame index. They are applied after the
-missing-data policy, while preserving the original row alignment.
-
-```python
-from Scaling_Law_Estimator import SplitConfig
-
-train_mask = df["date"] < "2018-01-01"
-val_mask = (df["date"] >= "2018-01-01") & (df["date"] < "2020-01-01")
-test_mask = df["date"] >= "2020-01-01"
-
-config = ScalingLawConfig(
-    split=SplitConfig(
-        mode="masks",
-        train_mask=train_mask,
-        val_mask=val_mask,
-        test_mask=test_mask,
-    )
-)
-```
-
-## Pre-Split Arrays
-
-If your project already owns splitting, pass arrays directly to `run()`:
-
-```python
-experiment.run(X_train, y_train, X_val, y_val, X_test, y_test)
-```
-
-Or store them in `PreSplitData` for a DataSplitter-style workflow:
-
-```python
-from Scaling_Law_Estimator import PreSplitData, SplitConfig
-
-config = ScalingLawConfig(
-    split=SplitConfig(
-        mode="pre_split",
-        pre_split=PreSplitData(
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
-            X_test=X_test,
-            y_test=y_test,
-            test_dates=test_dates,
-        ),
-    )
-)
-```
-
-## R2 Benchmarks
-
-R2 is calculated relative to a benchmark prediction series. Built-in modes:
-
-```text
-historical_mean
-historical_mean_updating
-ar1
-ar1_updating
+update_existing  update or add model results as training proceeds
+overwrite        reset result artifacts before starting
+skip_existing    skip model_name entries already present in saved results
+fail_if_exists   raise if existing result artifacts contain data
 ```
 
 Example:
 
 ```python
-config = ScalingLawConfig(
-    benchmark={"mode": "historical_mean_updating"}
-)
-
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2"],
-    target_col="target",
-    date_col="date",
-    benchmark="ar1_updating",  # optional runtime override
-)
-```
-
-You can also supply a callable benchmark:
-
-```python
-import numpy as np
-
-def my_benchmark(y_train, y_val, y_test):
-    val_pred = np.full(len(y_val), np.mean(y_train))
-    test_pred = np.full(len(y_test), np.mean(np.concatenate([y_train, y_val])))
-    return val_pred, test_pred
+from scaling_laws import ResumeMode, RuntimeConfig, ScalingLawConfig
 
 config = ScalingLawConfig(
-    benchmark=my_benchmark
-)
-```
-
-Callable benchmarks may return either:
-
-```python
-(val_predictions, test_predictions)
-```
-
-or:
-
-```python
-{
-    "val_predictions": val_predictions,
-    "test_predictions": test_predictions,
-}
-```
-
-## Compute Accounting
-
-By default, FLOPs per epoch are estimated as:
-
-```text
-6 * actual_params * n_train
-```
-
-You can replace this with a custom callable:
-
-```python
-from Scaling_Law_Estimator import ComputeConfig
-
-def custom_flops(actual_params, train_samples, input_dim, architecture, model):
-    return 8 * actual_params * train_samples
-
-config = ScalingLawConfig(
-    compute=ComputeConfig(
-        flop_estimator=custom_flops,
-    )
-)
-```
-
-Saved result keys remain:
-
-```text
-flops_per_epoch
-total_flops
-pf_days
-training_curve.cumulative_pf_days
-```
-
-## Panel Portfolio Analysis
-
-Panel mode ranks cross-sectional predictions within each date and builds
-long-short portfolios.
-
-```python
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2", "x3"],
-    target_col="next_return",
-    date_col="date",
-    portfolio="panel",
-)
-```
-
-Panel outputs include:
-
-```text
-D1 ... D10
-Forecast_Weighted
-LS_50
-LS_30
-LS_10
-```
-
-Annualization defaults to monthly data:
-
-```python
-config = ScalingLawConfig(
-    annualization_periods=12
-)
-```
-
-For daily data, choose something like:
-
-```python
-config = ScalingLawConfig(
-    annualization_periods=252
-)
-```
-
-### Optional Panel Transaction Costs
-
-Panel transaction-cost accounting requires asset identifiers.
-
-```python
-config = ScalingLawConfig(
-    transaction_cost_rate=0.001,
-    portfolio={"asset_id_col": "permno"},
-)
-
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2"],
-    target_col="next_return",
-    date_col="date",
-    portfolio="panel",
-    asset_id_col="permno",
-)
-```
-
-If no `asset_id_col` is supplied, panel behavior remains unchanged.
-
-## Time-Series Portfolio Analysis
-
-Time-series mode treats the predictions as forecasts for one asset or one
-aggregate return series. It creates a forecast-timed strategy.
-
-```python
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2"],
-    target_col="market_return",
-    date_col="date",
-    portfolio="ts",
-)
-```
-
-Configure the strategy:
-
-```python
-from Scaling_Law_Estimator import TSStrategyConfig, TradingConfig
-
-config = ScalingLawConfig(
-    ts_strategy=TSStrategyConfig(
-        kappa=2.0,
-        min_periods=12,
-        winsorize_weights=True,
-        weight_floor=-1.0,
-        weight_cap=3.0,
-        signal_lag=1,
-        standardize_signal=False,
-    ),
-    trading=TradingConfig(
-        transaction_cost_rate=0.0005,
-        leverage_cap=2.0,
-        long_only=False,
-        allow_short=True,
-    ),
-)
-```
-
-Legacy runtime override still works:
-
-```python
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["x1", "x2"],
-    target_col="market_return",
-    date_col="date",
-    portfolio="ts",
-    kappa=1.5,
-)
-```
-
-TS output includes:
-
-```text
-actual_return
-prediction
-hist_mean
-hist_std
-z_score
-weight
-turnover
-transaction_cost
-gross_strategy_return
-strategy_return
-```
-
-## Plotting
-
-After an experiment finishes, create the standard plot bundle:
-
-```python
-experiment.create_plots(dpi=300)
-```
-
-Or use the plotter directly:
-
-```python
-from Scaling_Law_Estimator import ScalingLawPlotter
-
-plotter = ScalingLawPlotter("./Output/dataframe_run")
-
-plotter.plot_scaling_curves(
-    loss_type="val_loss",
-    x_axis="compute",
-)
-
-plotter.plot_final_performance(
-    metric="test_loss",
-    x_axis="compute",
-)
-
-plotter.plot_sharpe_ratio_scaling(
-    breakpoint="50",
-    x_axis="compute",
-)
-```
-
-If you customized artifact names, pass the same artifact config:
-
-```python
-plotter = ScalingLawPlotter(
-    "./Output/custom_names",
-    artifacts=config.output.artifacts,
-)
-```
-
-## A Complete Minimal Research Script
-
-```python
-import numpy as np
-import pandas as pd
-
-from Scaling_Law_Estimator import (
-    ScalingLawConfig,
-    ScalingLawExperiment,
-    ArchitectureMode,
-    NormalizationType,
-    ResumeMode,
-)
-
-rng = np.random.default_rng(42)
-n_dates = 120
-n_assets = 100
-
-dates = np.repeat(pd.date_range("2010-01-31", periods=n_dates, freq="ME"), n_assets)
-permno = np.tile(np.arange(n_assets), n_dates)
-
-df = pd.DataFrame({
-    "date": dates,
-    "permno": permno,
-    "value": rng.normal(size=n_dates * n_assets),
-    "momentum": rng.normal(size=n_dates * n_assets),
-    "quality": rng.normal(size=n_dates * n_assets),
-})
-
-df["next_return"] = (
-    0.01 * df["value"]
-    + 0.02 * df["momentum"]
-    - 0.01 * df["quality"]
-    + rng.normal(scale=0.05, size=len(df))
-)
-
-config = ScalingLawConfig(
-    normalization=NormalizationType.LAYER,
-    architecture_mode=ArchitectureMode.FIXED_DEPTH,
-    fixed_depth_layers=3,
-    dropout_rate=0.1,
+    runtime=RuntimeConfig(resume=ResumeMode.SKIP_EXISTING),
+    output={"output_dir": "./Output/resume_demo"},
     param_sizes=["1K", "10K", "100K"],
-    epochs=20,
-    batch_size=8192,
-    learning_rate=0.001,
-    test_size="2018-01-31",
-    val_size="2016-01-31",
-    output_dir="./Output/minimal_research",
-    resume=ResumeMode.OVERWRITE,
-    random_state=42,
-    annualization_periods=12,
 )
-
-experiment = ScalingLawExperiment(config)
-results = experiment.run_from_dataframe(
-    df=df,
-    feature_cols=["value", "momentum", "quality"],
-    target_col="next_return",
-    date_col="date",
-    portfolio="panel",
-    asset_id_col="permno",
-)
-
-experiment.create_plots(dpi=300)
 ```
 
-## Result Dictionary
+## Output Files
 
-Each trained model stores a result dictionary with keys such as:
+By default, outputs are written under `OutputConfig.output_dir`.
 
 ```text
-model_name
-target_params
-actual_params
-architecture
-train_loss
-val_loss
-test_loss
-val_r2
-test_r2
-train_time
-total_flops
-pf_days
-epochs
-batch_size
-learning_rate
-flops_per_epoch
-normalization
-architecture_mode
-portfolio_mode
-benchmark
-annualization_periods
-portfolio_stats
-training_curve
+scaling_results.pkl       Pickled list of per-model result dictionaries
+scaling_results.json      JSON-safe copy of the saved model results
+portfolio_returns.csv     Panel or time-series portfolio returns, if available
+test_sample.csv           Test-sample rows and metadata for DataFrame runs
+Models/                   Saved Keras models, if save_models=True
 ```
 
-`training_curve` contains:
+Training-history plots may also be saved under `Models/` as:
 
 ```text
-epochs
-train_loss
-val_loss
-cumulative_flops
-cumulative_pf_days
+Models/<model_name>_training.png
 ```
 
-## Common Recipes
-
-### Train One Model Size Only
-
-```python
-config = ScalingLawConfig(
-    param_sizes=["100K"],
-    epochs=50,
-)
-```
-
-### Train A Range But Start In The Middle
-
-```python
-config = ScalingLawConfig(
-    param_sizes=ScalingLawExperiment.make_param_sizes(jump=50),
-    start_at_size="100K",
-    stop_at_size="10M",
-)
-```
-
-### Skip Models Already Completed
-
-```python
-config = ScalingLawConfig(
-    output_dir="./Output/long_run",
-    resume="skip_existing",
-)
-```
-
-### Fail Rather Than Accidentally Reuse An Output Directory
-
-```python
-config = ScalingLawConfig(
-    output_dir="./Output/fresh_run",
-    resume="fail_if_exists",
-)
-```
-
-### Use No Dropout
-
-```python
-config = ScalingLawConfig(
-    dropout_rate=0.0,
-)
-```
-
-### Disable Input Normalization
-
-```python
-config = ScalingLawConfig(
-    use_input_normalization=False,
-)
-```
-
-### Use Batch Normalization
-
-```python
-config = ScalingLawConfig(
-    normalization="batch",
-)
-```
-
-### Use No Hidden-Layer Normalization
-
-```python
-config = ScalingLawConfig(
-    normalization="none",
-)
-```
-
-### Save Keras Models
-
-```python
-config = ScalingLawConfig(
-    save_models=True,
-    output_dir="./Output/save_models_demo",
-)
-```
-
-Models are saved under:
+Plotting can create files such as:
 
 ```text
-./Output/save_models_demo/Models/model_<size>.keras
+scaling_curves_val_compute.png
+test_loss_vs_compute.png
+val_r2_vs_compute.png
+test_r2_vs_compute.png
+sharpe_ratio_Forecast_Weighted_vs_compute.png
+sharpe_ratio_LS50_vs_compute.png
+sharpe_ratio_LS30_vs_compute.png
+sharpe_ratio_LS10_vs_compute.png
 ```
 
-### Use Mixed Precision
+## Simulation Example
 
-```python
-config = ScalingLawConfig(
-    precision=16,
-)
+The repository includes:
+
+```text
+Testing/simulation_example.py
 ```
 
-Supported precision values are `8`, `16`, `32`, and `64`. The default is `32`.
-Use reduced precision only when your hardware and numerical setup are appropriate.
+This script simulates a characteristic-driven firm-month panel. Characteristics
+are observed at month `t`, and the target `ret_exc` is the excess return earned
+in month `t + 1`.
 
-## Troubleshooting
+The hidden expected-return function combines:
 
-### ImportError: No module named tensorflow
+1. Linear characteristic levels
+2. Nonlinear single-characteristic transforms
+3. Pairwise characteristic interactions
+4. Nonlinear pairwise interactions
+5. Common month-level shocks
+6. Idiosyncratic firm-level shocks
 
-Install TensorFlow in the environment where you run the experiment:
+The default output directory is:
+
+```text
+~/Desktop/characteristic next return simulation
+```
+
+The script saves a simulated panel CSV, runs the scaling-law experiment,
+performs panel portfolio analysis, saves the standard result files, and then
+attempts to create plots.
+
+Edit these top-level constants first:
+
+- **`N_MONTHS`**: number of simulated signal months
+- **`N_FIRMS`**: number of firms per month
+- **`N_FIRM_CHARS`**: number of characteristics
+- **Signal strengths**: linear, nonlinear, pairwise, and nonlinear interaction
+  strengths
+- **Noise scales**: common and idiosyncratic shock scales
+- **`OUTPUT_DIR`**: where files are written
+- **Fuzzy-stop controls**: optional training extension behavior
+- **`param_sizes`** inside `build_config(...)`: model-size grid
+
+Run the example from the repository root:
 
 ```bash
-pip install tensorflow
+python Testing/simulation_example.py
 ```
 
-### No GPU Found
+This script is intentionally more substantial than a smoke test. Reduce sample
+sizes and model sizes before running it on a laptop.
 
-The code can run on CPU, but scaling-law sweeps are usually expensive. The
-experiment prints detected GPU devices at startup.
+## Research Applications
 
-### Empty Split Error
+Financial Economics Scaling Laws can be used for:
 
-If you see an empty train/validation/test split error, check:
+1. Estimating compute-performance scaling laws in return prediction.
+2. Comparing forecasting problems with different predictor sets.
+3. Studying whether additional data raises the asymptotic performance frontier.
+4. Measuring how quickly forecast performance improves with model scale.
+5. Comparing statistical forecast metrics with economic portfolio metrics.
+6. Stress-testing whether larger models are worth the additional compute.
+7. Adapting the scaling-law methodology to macro, asset pricing, and other
+   economics time-series settings.
 
-```python
-config.test_size
-config.val_size
-config.split.mode
-df["date"].min(), df["date"].max()
-```
+## Performance Considerations
 
-For date cutoffs, `val_size` must be before `test_size`.
+- Scaling-law experiments can be expensive because the same workflow is repeated
+  across many model sizes.
+- Start with a small parameter grid such as `["250", "1K", "5K"]`.
+- Use short epoch schedules for smoke tests and larger schedules for research
+  runs.
+- CPU execution is possible but can be slow for large neural networks.
+- Apple Silicon users may benefit from `tensorflow-metal`.
+- Use `ResumeMode.SKIP_EXISTING` or `ResumeMode.UPDATE_EXISTING` for long runs.
+- Saving models can consume substantial disk space; leave `save_models=False`
+  unless you need the trained Keras models.
 
-### Portfolio Returns Are Missing
+## Contributing and Modifying
 
-Portfolio returns are only saved when `test_dates` are available. If you call
-`run(...)` directly with arrays, pass `test_dates`:
+This package is intended to be modified and extended. Researchers are free to
+change architectures, loss functions, data splits, portfolio construction,
+compute accounting, plotting, or any other part of the workflow for their own
+research questions.
 
-```python
-experiment.run(
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    X_test,
-    y_test,
-    test_dates=test_dates,
-    portfolio="panel",
-)
-```
+The defaults are meant to provide a clear starting point based on the paper's
+methods, not to constrain how the package can be used.
 
-`run_from_dataframe(...)` handles this automatically.
+## License
 
-### Existing Results Are Being Updated
-
-That is the default old behavior. Use:
-
-```python
-resume="skip_existing"
-```
-
-or:
-
-```python
-resume=False
-```
-
-depending on whether you want to skip completed models or overwrite artifacts.
-
-## Design Principle
-
-The defaults are intentionally conservative: they preserve the original research
-script's methods and behavior. New configuration options are opt-in. This makes
-the module suitable for package use without silently changing existing
-experiments.
+See `LICENSE` for project licensing terms.

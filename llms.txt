@@ -1,0 +1,164 @@
+Fin_Econ_Scaling_Laws
+Financial Economics Scaling Laws
+
+Purpose
+- This is a Python package for estimating scaling laws in economics and finance forecasting problems.
+- It is a methods package, not a replication package and not a web service.
+- The PyPI/project name is Fin_Econ_Scaling_Laws.
+- The Python import module is scaling_laws.
+- The package trains neural networks over multiple model sizes, records forecast performance and compute, evaluates optional portfolio strategies, and creates scaling-law plots.
+- The intended user is a researcher who wants to apply or modify scaling-law estimation on their own time-series, panel, macro, asset-pricing, or return-predictability data.
+
+Paper
+- Methods are based on "Compute, Complexity, and the Scaling Laws of Return Predictability" by Allan Timmermann and Luka Vulicevic.
+- SSRN: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6105327
+- Author websites:
+  - Allan Timmermann: https://rady.ucsd.edu/faculty-research/faculty/allan-timmermann.html
+  - Luka Vulicevic: https://www.lukavulicevic.com/
+- Academic citation:
+  @article{timmermann2026compute,
+    title={Compute, Complexity, and the Scaling Laws of Return Predictability},
+    author={Timmermann, Allan and Vulicevic, Luka},
+    journal={Available at SSRN 6105327},
+    year={2026}
+  }
+
+Conceptual summary
+- Scaling laws relate forecast performance to computational scale.
+- In this package, compute is usually cumulative training compute, measured in PetaFLOP-days.
+- The paper studies power-law relationships where loss approaches an irreducible floor and Sharpe ratios can approach an attainable ceiling.
+- The package provides reusable machinery for estimating similar relationships on other economics and finance datasets.
+- Users are free to change the methodology. Defaults are starting points based on the paper, not restrictions.
+
+Repository map
+- README.md: human-facing package documentation.
+- llms.txt: this LLM-facing guide.
+- requirements.txt: runtime dependencies.
+- pyproject.toml: package metadata and install dependencies.
+- Testing/simulation_example.py: synthetic firm-month panel example.
+- scaling_laws/__init__.py: package exports.
+- scaling_laws/config.py: dataclass configuration objects.
+- scaling_laws/enums.py: enum values for normalization, architecture, portfolio mode, resume mode, split mode, and missing-data policy.
+- scaling_laws/experiment.py: ScalingLawExperiment, the main experiment runner.
+- scaling_laws/model_builder.py: Keras model construction.
+- scaling_laws/data_splitter.py: DataFrame and pre-split array handling.
+- scaling_laws/results.py: result and artifact persistence.
+- scaling_laws/portfolio.py: panel and time-series portfolio evaluation.
+- scaling_laws/plotting.py: scaling-law and portfolio plotting utilities.
+- scaling_laws/callbacks.py: training callbacks, live plots, R2 metric, fuzzy stop.
+- scaling_laws/utils/format.py: parse_size and format_params.
+- scaling_laws/utils/memory.py: cleanup and optional psutil memory diagnostics.
+- scaling_laws/utils/system.py: TensorFlow system information printing.
+
+Important naming
+- Do not describe this as a remote service, endpoint, or web product.
+- Prefer "package", "methods package", "workflow", "interface", "tools", or "experiment runner".
+- Public-facing package name: Fin_Econ_Scaling_Laws.
+- Full name: Financial Economics Scaling Laws.
+- Import path in code examples: scaling_laws.
+
+Main imports
+- Common user imports:
+  from scaling_laws import ScalingLawConfig, ScalingLawExperiment
+  from scaling_laws import TrainingConfig, SplitConfig, OutputConfig, RuntimeConfig, ResumeMode
+- Direct plotting import:
+  from scaling_laws.plotting import ScalingLawPlotter
+- Useful helpers:
+  from scaling_laws import parse_size, format_params
+
+Main workflows
+- DataFrame workflow:
+  1. Put predictors, target, and date column in a pandas DataFrame.
+  2. Create ScalingLawConfig.
+  3. Create ScalingLawExperiment(config).
+  4. Run experiment.run(df, X=[feature columns], y="target", date_col="date").
+  5. Optionally pass portfolio="panel" or portfolio="ts".
+  6. Call experiment.create_plots(dpi=300) after results are saved.
+- Pre-split arrays workflow:
+  1. Prepare X_train, y_train, X_val, y_val, X_test, y_test.
+  2. Run experiment.run_from_arrays(...).
+  3. Pass test_dates if portfolio analysis is needed.
+  4. Pass asset_ids for panel portfolio accounting by asset.
+- Simulation workflow:
+  1. Inspect Testing/simulation_example.py.
+  2. Reduce N_MONTHS, N_FIRMS, param_sizes, and epochs for quick local tests.
+  3. Run python Testing/simulation_example.py from the repository root.
+  4. Outputs go to ~/Desktop/characteristic next return simulation by default.
+
+Data expectations
+- DataFrame runs need:
+  - date column
+  - feature columns observed before the target
+  - target column at the forecast horizon
+  - optional asset id column for panel portfolio analysis
+- The package is not limited to stock returns. It can be adapted to macro, asset-pricing, panel, and other economics time-series prediction problems.
+- Avoid random row splits for time-series or panel data unless the user explicitly wants that. Prefer date-based splits.
+
+Key configuration objects
+- ScalingLawConfig: top-level config; controls param_sizes, start_at_size, stop_at_size.
+- ArchitectureConfig: network normalization, mode, depth, dropout, initializer, activation.
+- TrainingConfig: epochs, batch sizes, learning rate, optimizer, clip norm.
+- SchedulerConfig: learning-rate scheduler.
+- FuzzyStopConfig: optional extension-window stop after the scheduled epoch floor.
+- RuntimeConfig: resume behavior, random seed, live plots, memory diagnostics.
+- ComputeConfig: precision, determinism, FLOP estimator.
+- OutputConfig and ArtifactNames: output directory and artifact names.
+- SplitConfig and PreSplitData: date splits, masks, or already split arrays.
+- MissingDataConfig: missing-data policy.
+- BenchmarkConfig: benchmark used for OOS R2.
+- AnnualizationConfig: periods used in annualized portfolio stats.
+- TradingConfig: transaction costs and trading constraints.
+- TSStrategyConfig: time-series strategy parameters.
+- PortfolioConfig: panel or time-series mode and optional asset id column.
+
+Common enum values
+- ArchitectureMode: tapered, fixed_depth.
+- NormalizationType: layer, batch, none.
+- InitializerType: he_normal, glorot_uniform.
+- PortfolioMode: panel, ts.
+- ResumeMode: update_existing, overwrite, skip_existing, fail_if_exists.
+- SplitMode: auto, date_cutoffs, date_proportions, masks, pre_split.
+- MissingDataPolicy: drop_any, drop_target_only, error, impute_mean.
+
+Output artifacts
+- scaling_results.pkl: pickled list of per-model result dictionaries.
+- scaling_results.json: JSON-safe copy of result dictionaries.
+- portfolio_returns.csv: panel or time-series portfolio return data when available.
+- test_sample.csv: test-sample rows and metadata for DataFrame runs.
+- Models/: Keras models if save_models=True; training-history PNGs may also be written here.
+- Plot PNGs include scaling curves, test loss, validation/test R2, forecast-weighted Sharpe, LS breakpoint Sharpe plots, and time-series Sharpe plots when applicable.
+
+Guidance for modifying the package
+- Users are allowed to modify methods. Do not imply changes are forbidden.
+- When editing, preserve existing behavior unless the requested change clearly asks for a different method.
+- Keep examples accurate to the current code. The DataFrame method is experiment.run(...).
+- The root package currently exports many config classes and helpers, but ScalingLawPlotter is imported from scaling_laws.plotting.
+- If adding a new user-facing config option, update config.py, any relevant consumer module, README.md, and llms.txt.
+- If changing saved artifact names, update ArtifactNames and docs.
+- If changing portfolio logic, inspect portfolio.py and results.py together.
+- If changing split behavior, inspect data_splitter.py and experiment.py together.
+- If changing model architecture behavior, inspect model_builder.py and config.py together.
+- If changing compute accounting, inspect ComputeConfig in config.py and train_single_model in experiment.py.
+
+Safe quick checks
+- Syntax check:
+  python -m compileall scaling_laws Testing/simulation_example.py
+- Legacy-name check:
+  search README.md and llms.txt for old monolith names before finishing
+- README/package naming check:
+  search README.md and llms.txt for remote-service language before finishing
+- TOML parse check:
+  python -c "import tomllib; tomllib.load(open('pyproject.toml','rb')); print('ok')"
+
+Performance notes
+- Full scaling-law runs can be expensive.
+- For smoke tests, use small param_sizes such as ["250", "1K"] and very few epochs.
+- Do not run Testing/simulation_example.py casually at full size; it is an executable methodology example, not a tiny unit test.
+- CPU runs are possible but slow for large grids.
+- Apple Silicon may use tensorflow-metal if installed.
+
+Documentation tone
+- Use the Entity Neutering README style: direct overview, authors, academic paper, key features, project structure, parameters, usage examples, data requirements, outputs, research applications, performance considerations, contribution note, license.
+- Avoid sales language.
+- Avoid presenting this as a locked-down paper replication package.
+- Emphasize that Financial Economics Scaling Laws helps researchers estimate scaling laws in their own economics and finance data.
