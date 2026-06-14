@@ -211,6 +211,86 @@ class SchedulerConfig:
 
 
 @dataclass
+class FuzzyStopConfig:
+    """Fuzzy training-stop configuration.
+
+    When ``enabled`` is True, training continues past the scheduled epoch
+    budget until a causal-median-smoothed validation metric has stalled for
+    ``patience`` consecutive epochs, then optionally restores weights to
+    the smoothed-best epoch. Intended for runs that exhibit double-descent
+    or persistent oscillation, where stopping at an arbitrary scheduled
+    epoch can land on an ascent peak. Median smoothing is used (rather
+    than mean/EMA) because it survives the large isolated spikes that
+    appear during chaotic training phases.
+
+    Any field left as ``None`` is auto-resolved from the scheduled epoch
+    count at training start via :meth:`resolve`.
+    """
+    enabled: bool = False
+    monitor: str = "val_r2_percent"
+    mode: Optional[str] = None
+    smoothing_window: Optional[int] = None
+    patience: Optional[int] = None
+    max_extra_epochs: Optional[int] = None
+    restore_best_weights: bool = True
+
+    def __post_init__(self):
+        self.enabled = bool(self.enabled)
+        if not isinstance(self.monitor, str) or not self.monitor.strip():
+            raise ValueError("FuzzyStopConfig.monitor must be a non-empty string")
+        self.monitor = self.monitor.strip()
+        if self.mode is not None:
+            mode_normalized = str(self.mode).lower()
+            if mode_normalized not in ("min", "max"):
+                raise ValueError(
+                    f"FuzzyStopConfig.mode must be 'min', 'max', or None; got {self.mode!r}"
+                )
+            self.mode = mode_normalized
+        for name in ("smoothing_window", "patience", "max_extra_epochs"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            value = int(value)
+            if value < 1:
+                raise ValueError(
+                    f"FuzzyStopConfig.{name} must be >= 1 when set, got {value}"
+                )
+            setattr(self, name, value)
+        self.restore_best_weights = bool(self.restore_best_weights)
+
+    def resolve(self, scheduled_epochs: int) -> "FuzzyStopConfig":
+        """Materialize all auto fields against a concrete epoch budget.
+
+        Returns the receiver unchanged when disabled, so callers can rely
+        on the resolved object's flags without an extra branch.
+        """
+        if not self.enabled:
+            return self
+        scheduled_epochs = max(1, int(scheduled_epochs))
+        mode = self.mode
+        if mode is None:
+            mode = "min" if "loss" in self.monitor.lower() else "max"
+        window = self.smoothing_window
+        if window is None:
+            window = max(10, min(100, scheduled_epochs // 25))
+        patience = self.patience
+        if patience is None:
+            patience = 2 * window
+        cap = self.max_extra_epochs
+        if cap is None:
+            cap = max(1, scheduled_epochs // 2)
+        return FuzzyStopConfig(
+            enabled=True,
+            monitor=self.monitor,
+            mode=mode,
+            smoothing_window=window,
+            patience=patience,
+            max_extra_epochs=cap,
+            restore_best_weights=self.restore_best_weights,
+        )
+
+
+@dataclass
 class RuntimeConfig:
     """Runtime behavior and reproducibility configuration."""
     show_live_plots: bool = False
@@ -499,6 +579,7 @@ class ScalingLawConfig:
     architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    fuzzy_stop: FuzzyStopConfig = field(default_factory=FuzzyStopConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     compute: ComputeConfig = field(default_factory=ComputeConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
@@ -519,6 +600,7 @@ class ScalingLawConfig:
         "architecture": ArchitectureConfig,
         "training": TrainingConfig,
         "scheduler": SchedulerConfig,
+        "fuzzy_stop": FuzzyStopConfig,
         "runtime": RuntimeConfig,
         "compute": ComputeConfig,
         "output": OutputConfig,
@@ -594,6 +676,7 @@ class ScalingLawConfig:
             architecture: Optional[Union[ArchitectureConfig, Dict[str, Any]]] = None,
             training: Optional[Union[TrainingConfig, Dict[str, Any]]] = None,
             scheduler: Optional[Union[SchedulerConfig, Dict[str, Any]]] = None,
+            fuzzy_stop: Optional[Union[FuzzyStopConfig, Dict[str, Any]]] = None,
             runtime: Optional[Union[RuntimeConfig, Dict[str, Any]]] = None,
             compute: Optional[Union[ComputeConfig, Dict[str, Any]]] = None,
             output: Optional[Union[OutputConfig, Dict[str, Any]]] = None,
@@ -620,6 +703,11 @@ class ScalingLawConfig:
             self,
             "scheduler",
             self._coerce_nested_config("scheduler", scheduler)
+        )
+        object.__setattr__(
+            self,
+            "fuzzy_stop",
+            self._coerce_nested_config("fuzzy_stop", fuzzy_stop)
         )
         object.__setattr__(
             self,
@@ -689,6 +777,7 @@ class ScalingLawConfig:
     def __post_init__(self):
         """Validate and convert configuration values."""
         self.architecture.__post_init__()
+        self.fuzzy_stop.__post_init__()
         self.runtime.__post_init__()
         self.compute.__post_init__()
         self.output.__post_init__()
@@ -1271,6 +1360,161 @@ class SingleLineProgressCallback(Callback):
         if hours > 0:
             return f"{hours:02d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:02d}:{secs:02d}"
+
+
+class FuzzyStopCallback(Callback):
+    """Extend training past ``scheduled_epochs`` and stop at a local optimum.
+
+    The scheduled epoch count is treated as a hard *minimum* — training will
+    not terminate before it. Raw monitor values are recorded for the whole
+    run and converted to a causal median over the last ``smoothing_window``
+    values; the smoothed-best value, the raw value at that epoch, and the
+    weights at that epoch are tracked **only from the scheduled epoch
+    onwards**. So the local optimum we lock on to is one that occurred in
+    the extension window, not somewhere in the warm-up phase. Training
+    halts once either:
+
+    * ``patience`` epochs have elapsed since the last smoothed-best update
+      within the extension window — the smoothed metric has demonstrably
+      walked off its optimum, so we are past a local extremum; or
+    * the extra-epoch budget is exhausted — a hard cap so noisy runs that
+      never confirm a stop terminate in bounded time.
+
+    On stop, the current epoch's raw monitor value is compared against the
+    raw value at the smoothed-best epoch. If the current model is actually
+    better on the raw metric, its weights are kept; otherwise weights are
+    restored to the smoothed-best epoch (when ``restore_best_weights`` is
+    True). The callback exposes ``triggered``, ``stop_reason``,
+    ``actual_epochs``, ``restored_to_epoch``, and ``kept_current_epoch``
+    for downstream logging.
+    """
+
+    _STOP_LOCAL_OPT: ClassVar[str] = "local_optimum_confirmed"
+    _STOP_MAX_EXTRA: ClassVar[str] = "max_extra_epochs"
+
+    def __init__(
+            self,
+            scheduled_epochs: int,
+            monitor: str,
+            mode: str,
+            smoothing_window: int,
+            patience: int,
+            max_extra_epochs: int,
+            restore_best_weights: bool = True,
+    ):
+        super().__init__()
+        mode_normalized = str(mode).lower()
+        if mode_normalized not in ("min", "max"):
+            raise ValueError(f"mode must be 'min' or 'max', got {mode!r}")
+        self.scheduled_epochs = max(1, int(scheduled_epochs))
+        self.monitor = str(monitor)
+        self.mode = mode_normalized
+        self.smoothing_window = max(1, int(smoothing_window))
+        self.patience = max(1, int(patience))
+        self.max_extra_epochs = max(0, int(max_extra_epochs))
+        self.restore_best_weights = bool(restore_best_weights)
+
+        self._raw_history: List[float] = []
+        self._smoothed_history: List[float] = []
+        self._best_value: Optional[float] = None
+        self._best_raw: Optional[float] = None
+        self._best_epoch: int = -1
+        self._best_weights: Optional[List[np.ndarray]] = None
+        self._last_raw: Optional[float] = None
+
+        self.triggered: bool = False
+        self.stop_reason: Optional[str] = None
+        self.actual_epochs: int = 0
+        self.restored_to_epoch: Optional[int] = None
+        self.kept_current_epoch: bool = False
+
+    def _is_better(self, candidate: float, incumbent: float) -> bool:
+        if self.mode == "min":
+            return candidate < incumbent
+        return candidate > incumbent
+
+    def on_epoch_end(self, epoch: int, logs: Optional[Dict[str, Any]] = None):
+        logs = logs or {}
+        if self.monitor not in logs:
+            return
+        raw = float(logs[self.monitor])
+        if not np.isfinite(raw):
+            return
+
+        self._raw_history.append(raw)
+        window = self._raw_history[-self.smoothing_window:]
+        smoothed = float(np.median(window))
+        self._smoothed_history.append(smoothed)
+        self._last_raw = raw
+        self.actual_epochs = epoch + 1
+
+        # Phase 1: scheduled training is a hard floor — record raw history
+        # so smoothing is warm at the boundary, but do not track best or
+        # consider stopping.
+        if epoch + 1 < self.scheduled_epochs:
+            return
+
+        # Phase 2: smoothed-best tracking starts at the scheduled boundary
+        # so the local optimum we lock on to is one found in the extension
+        # window, never one from the warm-up phase.
+        if self._best_value is None or self._is_better(smoothed, self._best_value):
+            self._best_value = smoothed
+            self._best_raw = raw
+            self._best_epoch = epoch
+            if self.restore_best_weights:
+                self._best_weights = self.model.get_weights()
+
+        epochs_since_best = epoch - self._best_epoch
+        extra_epochs_used = (epoch + 1) - self.scheduled_epochs
+
+        if epochs_since_best >= self.patience:
+            self._stop(self._STOP_LOCAL_OPT)
+        elif extra_epochs_used >= self.max_extra_epochs:
+            self._stop(self._STOP_MAX_EXTRA)
+
+    def _stop(self, reason: str):
+        self.triggered = True
+        self.stop_reason = reason
+
+        # Final pick: compare the current epoch's raw monitor value against
+        # the raw value at the smoothed-best epoch. Keep current unless
+        # best is *strictly* better — that way ties (incl. the trivial
+        # case where best epoch == current epoch) avoid an unnecessary
+        # set_weights call. This guards against the smoothed-best epoch
+        # being a lucky-smoothing point with a mediocre raw value, and
+        # against the current epoch being a noise spike past a real peak.
+        current_wins = (
+            self._best_raw is None
+            or self._last_raw is None
+            or not self._is_better(self._best_raw, self._last_raw)
+        )
+
+        if current_wins:
+            self.kept_current_epoch = True
+            comparison_note = (
+                f"; kept current epoch (raw={self._last_raw:.6g}"
+                + (f" beats best-smoothed raw={self._best_raw:.6g}"
+                   if self._best_raw is not None else "")
+                + ")"
+            )
+        elif self.restore_best_weights and self._best_weights is not None:
+            self.model.set_weights(self._best_weights)
+            self.restored_to_epoch = self._best_epoch + 1
+            self.kept_current_epoch = False
+            comparison_note = (
+                f"; restored weights to epoch {self.restored_to_epoch} "
+                f"(raw={self._best_raw:.6g} beats current raw={self._last_raw:.6g})"
+            )
+        else:
+            self.kept_current_epoch = True
+            comparison_note = ""
+
+        self.model.stop_training = True
+        sys.stdout.write(
+            f"\nFuzzy stop [{reason}] at epoch {self.actual_epochs} "
+            f"(monitor={self.monitor}, mode={self.mode}){comparison_note}\n"
+        )
+        sys.stdout.flush()
 
 
 # ============================================================================
@@ -4352,6 +4596,32 @@ class ScalingLawExperiment:
             )
             callbacks.append(live_plot)
 
+        # Fuzzy stop: optionally let training continue past `epochs` and
+        # terminate at the next confirmed local optimum of a smoothed
+        # validation metric. The model.fit budget is widened to
+        # `epochs + max_extra_epochs`; the callback halts within that.
+        fuzzy_stop = self.config.fuzzy_stop.resolve(epochs)
+        fuzzy_stop_callback: Optional[FuzzyStopCallback] = None
+        fit_epochs = epochs
+        if fuzzy_stop.enabled:
+            fuzzy_stop_callback = FuzzyStopCallback(
+                scheduled_epochs=epochs,
+                monitor=fuzzy_stop.monitor,
+                mode=fuzzy_stop.mode,
+                smoothing_window=fuzzy_stop.smoothing_window,
+                patience=fuzzy_stop.patience,
+                max_extra_epochs=fuzzy_stop.max_extra_epochs,
+                restore_best_weights=fuzzy_stop.restore_best_weights,
+            )
+            callbacks.append(fuzzy_stop_callback)
+            fit_epochs = epochs + fuzzy_stop.max_extra_epochs
+            print(
+                f"Fuzzy stop enabled: monitor={fuzzy_stop.monitor} "
+                f"({fuzzy_stop.mode}), window={fuzzy_stop.smoothing_window}, "
+                f"patience={fuzzy_stop.patience}, "
+                f"max_extra_epochs={fuzzy_stop.max_extra_epochs}"
+            )
+
         if self.config.debug_memory:
             MemoryManager.print_memory_usage("BEFORE training")
 
@@ -4360,7 +4630,7 @@ class ScalingLawExperiment:
         history = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
-            epochs=epochs,
+            epochs=fit_epochs,
             batch_size=self.config.train_batch_size,
             validation_batch_size=self.config.validation_batch_size,
             verbose=0,
@@ -4380,8 +4650,11 @@ class ScalingLawExperiment:
         if self.config.debug_memory:
             MemoryManager.print_memory_usage("AFTER training")
 
-        # Compute metrics
-        cumulative_flops = [(i + 1) * flops_per_epoch for i in range(epochs)]
+        # Compute metrics. Use the actual epoch count from history because
+        # fuzzy stop (or any future early-termination path) can make the
+        # realized run shorter than `fit_epochs`.
+        actual_epochs = len(history.history['loss'])
+        cumulative_flops = [(i + 1) * flops_per_epoch for i in range(actual_epochs)]
         cumulative_pf_days = [f / 8.64e19 for f in cumulative_flops]
 
         train_loss = float(history.history['loss'][-1])
@@ -4498,7 +4771,8 @@ class ScalingLawExperiment:
             'train_time': float(train_time),
             'total_flops': float(total_flops),
             'pf_days': float(total_pf_days),
-            'epochs': int(epochs),
+            'epochs': int(actual_epochs),
+            'scheduled_epochs': int(epochs),
             'batch_size': int(self.config.batch_size),
             'learning_rate': float(self.config.learning_rate),
             'flops_per_epoch': float(flops_per_epoch),
@@ -4514,13 +4788,29 @@ class ScalingLawExperiment:
             'trading_config': ScalingLawConfig._serialize_value(trading_config),
             'ts_strategy_config': ScalingLawConfig._serialize_value(ts_strategy_config),
             'training_curve': {
-                'epochs': list(range(1, epochs + 1)),
+                'epochs': list(range(1, actual_epochs + 1)),
                 'train_loss': train_loss_history,
                 'val_loss': val_loss_history,
                 'cumulative_flops': [float(x) for x in cumulative_flops],
                 'cumulative_pf_days': [float(x) for x in cumulative_pf_days]
             }
         }
+
+        if fuzzy_stop_callback is not None:
+            results_dict['fuzzy_stop'] = {
+                'enabled': True,
+                'monitor': fuzzy_stop.monitor,
+                'mode': fuzzy_stop.mode,
+                'smoothing_window': fuzzy_stop.smoothing_window,
+                'patience': fuzzy_stop.patience,
+                'max_extra_epochs': fuzzy_stop.max_extra_epochs,
+                'triggered': bool(fuzzy_stop_callback.triggered),
+                'stop_reason': fuzzy_stop_callback.stop_reason,
+                'restored_to_epoch': fuzzy_stop_callback.restored_to_epoch,
+                'kept_current_epoch': bool(fuzzy_stop_callback.kept_current_epoch),
+            }
+        else:
+            results_dict['fuzzy_stop'] = {'enabled': False}
 
         if portfolio_stats is not None:
             results_dict['portfolio_stats'] = portfolio_stats
