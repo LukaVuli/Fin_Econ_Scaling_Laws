@@ -17,26 +17,28 @@ Outputs are written to:
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from Scaling_Law_Estimator import (  # noqa: E402
+from scaling_laws import (
+    ArchitectureConfig,
     ArchitectureMode,
+    AnnualizationConfig,
+    ComputeConfig,
     FuzzyStopConfig,
     InitializerType,
     NormalizationType,
+    OutputConfig,
     ResumeMode,
+    RuntimeConfig,
     ScalingLawConfig,
     ScalingLawExperiment,
+    SchedulerConfig,
+    SplitConfig,
+    TrainingConfig,
     print_system_info,
 )
 
@@ -65,19 +67,23 @@ CONDITIONAL_MEAN_CLIP = 0.1  # Lower values cap extreme expected returns more ti
 
 OUTPUT_DIR = Path.home() / "Desktop" / "characteristic next return simulation"  # Output location.
 
-# Fuzzy training-stop controls. When enabled, training keeps going past the
-# scheduled epoch budget until a causal-median-smoothed validation metric
-# confirms a local optimum, then restores weights to that epoch. Any
+# Fuzzy training-stop controls. The scheduled epoch count is a HARD MINIMUM:
+# every model trains at least that many epochs no matter what. After that,
+# training continues for up to `max_extra_epochs` (or `max_extra_fraction *
+# scheduled_epochs`) further epochs, and fuzzy stop only terminates inside
+# that extension window — either when the smoothed monitor stalls for
+# `patience` epochs, or when the extra-epoch budget is exhausted. Any
 # parameter left as None is auto-resolved from the scheduled epoch count:
-#   smoothing_window -> clip(epochs // 25, 10, 100)
-#   patience         -> 2 * smoothing_window
-#   max_extra_epochs -> epochs // 2
-FUZZY_STOP_ENABLED = True  # Set False to fall back to a hard stop at the scheduled epoch.
+#   smoothing_window  -> clip(epochs // 25, 10, 100)
+#   patience          -> 2 * smoothing_window
+#   extension cap     -> max_extra_fraction * epochs (default 0.5 → +50%)
+FUZZY_STOP_ENABLED = True  # Set False to stop exactly at the scheduled epoch.
 FUZZY_STOP_MONITOR = "val_r2_percent"  # Or "val_loss"; auto-flips mode based on the name.
 FUZZY_STOP_MODE: Optional[str] = None  # "min", "max", or None to auto-derive from the monitor.
 FUZZY_STOP_SMOOTHING_WINDOW: Optional[int] = None  # Median window in epochs; None auto-resolves.
 FUZZY_STOP_PATIENCE: Optional[int] = None  # Epochs past best before stopping; None auto-resolves.
-FUZZY_STOP_MAX_EXTRA_EPOCHS: Optional[int] = None  # Hard cap on extension; None auto-resolves.
+FUZZY_STOP_MAX_EXTRA_EPOCHS: Optional[int] = None  # Absolute extra-epoch cap. Mutually exclusive with the fraction below.
+FUZZY_STOP_MAX_EXTRA_FRACTION: Optional[float] = 0.5  # Extension as a fraction of scheduled epochs (0.5 = +50%).
 FUZZY_STOP_RESTORE_BEST_WEIGHTS = True  # Snap weights back to the smoothed-best epoch on stop.
 
 
@@ -361,10 +367,6 @@ def simulate_characteristic_next_return_panel(
     return df, feature_cols
 
 
-def get_epochs(size: int) -> int:
-    return max(int((0.75 * (size ** 0.75))), 1) + 100
-
-
 def resolve_split_cutoffs(
         dates: pd.Series,
         val_months: int = 36,
@@ -398,13 +400,59 @@ def resolve_split_cutoffs(
 def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
     """Create the same size-aware scaling-law run configuration as the example."""
     return ScalingLawConfig(
-        normalization=NormalizationType.LAYER,
-        architecture_mode=ArchitectureMode.FIXED_DEPTH,
-        fixed_depth_layers=5,
-        dropout_rate=0.1,
-        dropout_middle_only=True,
-        initializer=InitializerType.HE_NORMAL,
-        use_input_normalization=True,
+        architecture=ArchitectureConfig(
+            normalization=NormalizationType.LAYER,
+            architecture_mode=ArchitectureMode.FIXED_DEPTH,
+            fixed_depth_layers=5,
+            dropout_rate=0.1,
+            dropout_middle_only=True,
+            initializer=InitializerType.HE_NORMAL,
+            use_input_normalization=True,
+        ),
+        training=TrainingConfig(
+            train_batch_size=65536,
+            prediction_batch_size=65536,
+            learning_rate=0.01,
+            clip_norm=1.0,
+        ),
+        scheduler=SchedulerConfig(
+            lr_scheduler_enabled=False,
+            lr_scheduler_factor=0.5,
+            lr_scheduler_patience=None,
+            lr_scheduler_min_lr=1e-10,
+        ),
+        fuzzy_stop=FuzzyStopConfig(
+            enabled=FUZZY_STOP_ENABLED,
+            monitor=FUZZY_STOP_MONITOR,
+            mode=FUZZY_STOP_MODE,
+            smoothing_window=FUZZY_STOP_SMOOTHING_WINDOW,
+            patience=FUZZY_STOP_PATIENCE,
+            max_extra_epochs=FUZZY_STOP_MAX_EXTRA_EPOCHS,
+            max_extra_fraction=FUZZY_STOP_MAX_EXTRA_FRACTION,
+            restore_best_weights=FUZZY_STOP_RESTORE_BEST_WEIGHTS,
+        ),
+        split=SplitConfig(
+            test_size=test_cutoff,
+            val_size=val_cutoff,
+        ),
+        output=OutputConfig(
+            output_dir=str(OUTPUT_DIR),
+            save_pickle=True,
+            save_json=True,
+            save_csv=True,
+            save_models=False,
+        ),
+        runtime=RuntimeConfig(
+            resume=ResumeMode.OVERWRITE,
+            random_state=RANDOM_STATE,
+            show_live_plots=True,
+            debug_memory=False,
+        ),
+        compute=ComputeConfig(
+            precision=16,
+            enable_determinism=True,
+        ),
+        annualization=AnnualizationConfig(periods=12),
         param_sizes=[
             "250",
             "500",
@@ -417,38 +465,6 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
             #"500K",
             #"1M"
         ],
-        epochs=get_epochs,
-        batch_size=65536,
-        prediction_batch_size=65536,
-        learning_rate=0.01,
-        clip_norm=1.0,
-        lr_scheduler_enabled=False,
-        lr_scheduler_factor=0.5,
-        lr_scheduler_patience=None,
-        lr_scheduler_min_lr=1e-10,
-        fuzzy_stop=FuzzyStopConfig(
-            enabled=FUZZY_STOP_ENABLED,
-            monitor=FUZZY_STOP_MONITOR,
-            mode=FUZZY_STOP_MODE,
-            smoothing_window=FUZZY_STOP_SMOOTHING_WINDOW,
-            patience=FUZZY_STOP_PATIENCE,
-            max_extra_epochs=FUZZY_STOP_MAX_EXTRA_EPOCHS,
-            restore_best_weights=FUZZY_STOP_RESTORE_BEST_WEIGHTS,
-        ),
-        test_size=test_cutoff,
-        val_size=val_cutoff,
-        output_dir=str(OUTPUT_DIR),
-        save_pickle=True,
-        save_json=True,
-        save_csv=True,
-        save_models=False,
-        resume=ResumeMode.OVERWRITE,
-        random_state=RANDOM_STATE,
-        precision=16,
-        enable_determinism=True,
-        show_live_plots=True,
-        debug_memory=False,
-        annualization_periods=12,
     )
 
 
@@ -497,10 +513,10 @@ def main() -> None:
 
     config = build_config(val_cutoff=val_cutoff, test_cutoff=test_cutoff)
     experiment = ScalingLawExperiment(config)
-    results = experiment.run_from_dataframe(
-        df=df,
-        feature_cols=feature_cols,
-        target_col="ret_exc",
+    results = experiment.run(
+        df,
+        X=feature_cols,
+        y="ret_exc",
         date_col="date",
         portfolio="panel",
         asset_id_col="permno",

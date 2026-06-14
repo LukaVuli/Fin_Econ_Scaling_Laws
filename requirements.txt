@@ -6,5 +6,5 @@ pandas>=2.2
 scipy>=1.11
 matplotlib>=3.8
 
-# Optional memory diagnostics
+# Optional memory diagnostics used when debug_memory=True
 psutil>=5.9
