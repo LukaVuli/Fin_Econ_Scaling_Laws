@@ -671,7 +671,7 @@ Edit these top-level constants first:
 Run the example from the repository root:
 
 ```bash
-python Testing/simulation_example.py
+python examples/simulation_example.py
 ```
 
 This script is intentionally more substantial than a smoke test. Reduce sample
