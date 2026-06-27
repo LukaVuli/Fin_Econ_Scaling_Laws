@@ -86,6 +86,7 @@ class TrainingConfig:
     train_batch_size: int = 8192
     validation_batch_size: Optional[int] = None
     prediction_batch_size: int = 262144
+    shuffle: bool = False
     learning_rate: float = 0.001
     optimizer: str = "adam"
     clip_norm: Optional[float] = 1.0
@@ -223,6 +224,7 @@ class ComputeConfig:
     precision: Union[int, str] = 32
     mixed_precision_policy: Optional[str] = None
     enable_determinism: bool = True
+    allow_tf32: bool = False
     flop_estimator: Optional[Callable[[int, int, int, List[int], Model], Union[int, float]]] = None
     _PRECISION_TO_POLICY: ClassVar[Dict[int, str]] = {
         8: "mixed_float8",

@@ -124,6 +124,13 @@ Fin_Econ_Scaling_Laws/
 
 ## Installation & Requirements
 
+### Platform support
+
+This package is currently supported for macOS / Apple Silicon workflows using
+TensorFlow with `tensorflow-metal`. NVIDIA/CUDA GPU systems may run the code, but
+they are not a supported target for now because we have observed training
+instability and backend-dependent behavior on those systems.
+
 ### From PyPI
 
 Install the package with:
@@ -437,11 +444,13 @@ rewriting the others.
 - **`start_at_size` / `stop_at_size`**: run only part of the size grid
 - **`TrainingConfig.epochs`**: fixed integer or callable schedule by parameter count
 - **`TrainingConfig.train_batch_size`**: training batch size
+- **`TrainingConfig.shuffle`**: whether Keras shuffles training rows each epoch
 - **`TrainingConfig.learning_rate`**: optimizer learning rate
 - **`SplitConfig.test_size` / `val_size`**: date proportions or date cutoffs
 - **`OutputConfig.output_dir`**: directory for saved outputs
 - **`RuntimeConfig.resume`**: behavior when outputs already exist
 - **`ComputeConfig.precision`**: numeric precision policy
+- **`ComputeConfig.allow_tf32`**: whether NVIDIA GPUs may use TF32 matrix math
 - **`PortfolioConfig.mode`**: `"panel"` or `"ts"`
 
 ### Example full configuration
@@ -482,6 +491,7 @@ config = ScalingLawConfig(
         train_batch_size=65_536,
         validation_batch_size=None,
         prediction_batch_size=262_144,
+        shuffle=False,
         learning_rate=0.001,
         optimizer="adam",
         clip_norm=1.0,
@@ -513,6 +523,7 @@ config = ScalingLawConfig(
     compute=ComputeConfig(
         precision=32,
         enable_determinism=True,
+        allow_tf32=False,
     ),
     benchmark=BenchmarkConfig(mode="historical_mean"),
     annualization=AnnualizationConfig(periods=12),
@@ -698,7 +709,8 @@ Financial Economics Scaling Laws can be used for:
 - Use short epoch schedules for smoke tests and larger schedules for research
   runs.
 - CPU execution is possible but can be slow for large neural networks.
-- Apple Silicon users may benefit from `tensorflow-metal`.
+- Apple Silicon with TensorFlow and `tensorflow-metal` is the primary supported
+  runtime for now.
 - Use `ResumeMode.SKIP_EXISTING` or `ResumeMode.UPDATE_EXISTING` for long runs.
 - Saving models can consume substantial disk space; leave `save_models=False`
   unless you need the trained Keras models.

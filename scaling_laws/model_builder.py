@@ -49,6 +49,10 @@ class ModelBuilder:
         """Get deterministic per-layer seeds from the configured base seed."""
         return int(self.config.runtime.random_state) + layer_index
 
+    def _get_output_initializer(self, layer_count: int):
+        """Use Keras' default output initializer, but with an explicit seed."""
+        return GlorotUniform(seed=self._get_layer_seed(layer_count))
+
     def _add_normalization(self, x, layer_index: int):
         """Add normalization layer based on configuration."""
         if self.config.architecture.normalization == NormalizationType.LAYER:
@@ -141,6 +145,7 @@ class ModelBuilder:
         outputs = Dense(
             self.config.architecture.output_units,
             activation=self.config.architecture.output_activation,
+            kernel_initializer=self._get_output_initializer(len(layers_config)),
         )(x)
         model = Model(inputs=inputs, outputs=outputs)
 
@@ -232,6 +237,7 @@ class ModelBuilder:
         outputs = Dense(
             self.config.architecture.output_units,
             activation=self.config.architecture.output_activation,
+            kernel_initializer=self._get_output_initializer(n_layers),
         )(x)
         model = Model(inputs=inputs, outputs=outputs)
 
@@ -259,4 +265,3 @@ class ModelBuilder:
             return self.build_tapered_model(input_dim, target_params)
         else:
             return self.build_fixed_depth_model(input_dim, target_params)
-

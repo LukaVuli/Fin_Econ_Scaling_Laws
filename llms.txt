@@ -97,11 +97,11 @@ Data expectations
 Key configuration objects
 - ScalingLawConfig: top-level config; controls param_sizes, start_at_size, stop_at_size.
 - ArchitectureConfig: network normalization, mode, depth, dropout, initializer, activation.
-- TrainingConfig: epochs, batch sizes, learning rate, optimizer, clip norm.
+- TrainingConfig: epochs, batch sizes, shuffle, learning rate, optimizer, clip norm.
 - SchedulerConfig: learning-rate scheduler.
 - FuzzyStopConfig: optional extension-window stop after the scheduled epoch floor.
 - RuntimeConfig: resume behavior, random seed, live plots, memory diagnostics.
-- ComputeConfig: precision, determinism, FLOP estimator.
+- ComputeConfig: precision, determinism, NVIDIA TF32 allowance, FLOP estimator.
 - OutputConfig and ArtifactNames: output directory and artifact names.
 - SplitConfig and PreSplitData: date splits, masks, or already split arrays.
 - MissingDataConfig: missing-data policy.
@@ -156,6 +156,8 @@ Performance notes
 - Do not run Testing/simulation_example.py casually at full size; it is an executable methodology example, not a tiny unit test.
 - CPU runs are possible but slow for large grids.
 - Apple Silicon may use tensorflow-metal if installed.
+- For cross-device behavior checks, prefer precision=32, enable_determinism=True,
+  allow_tf32=False, and shuffle=False before investigating model-level changes.
 
 Documentation tone
 - Use the Entity Neutering README style: direct overview, authors, academic paper, key features, project structure, parameters, usage examples, data requirements, outputs, research applications, performance considerations, contribution note, license.

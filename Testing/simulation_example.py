@@ -412,6 +412,7 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         training=TrainingConfig(
             train_batch_size=65536,
             prediction_batch_size=65536,
+            shuffle=False,
             learning_rate=0.01,
             clip_norm=1.0,
         ),
@@ -449,8 +450,9 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
             debug_memory=False,
         ),
         compute=ComputeConfig(
-            precision=16,
+            precision=32,
             enable_determinism=True,
+            allow_tf32=False,
         ),
         annualization=AnnualizationConfig(periods=12),
         param_sizes=[
@@ -461,9 +463,9 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
             "10K",
             "20K",
             "50K",
-            #"100K",
-            #"500K",
-            #"1M"
+            "100K",
+            "500K",
+            "1M"
         ],
     )
 

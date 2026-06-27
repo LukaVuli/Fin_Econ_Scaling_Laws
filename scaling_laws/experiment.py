@@ -6,6 +6,7 @@ import gc
 import json
 import os
 import pickle
+import random
 import time
 from dataclasses import fields
 from pathlib import Path
@@ -73,6 +74,28 @@ class ScalingLawExperiment:
 
     def _configure_tensorflow(self):
         """Configure TensorFlow settings based on configuration."""
+        # Determinism
+        if self.config.compute.enable_determinism:
+            os.environ['TF_DETERMINISTIC_OPS'] = '1'
+            os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+            os.environ['TF_CUDNN_USE_AUTOTUNE'] = '0'
+            try:
+                tf.config.experimental.enable_op_determinism()
+                print("✓ Deterministic operations enabled")
+            except Exception as e:
+                print(f"⚠ Could not enable determinism: {e}")
+
+        try:
+            tf.config.experimental.enable_tensor_float_32_execution(
+                bool(self.config.compute.allow_tf32)
+            )
+            print(
+                "✓ NVIDIA TF32 matrix math: "
+                f"{'enabled' if self.config.compute.allow_tf32 else 'disabled'}"
+            )
+        except Exception as e:
+            print(f"⚠ Could not configure NVIDIA TF32 behavior: {e}")
+
         # GPU configuration
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
@@ -84,17 +107,6 @@ class ScalingLawExperiment:
                 print(f"GPU configuration error: {e}")
         else:
             print("⚠ No GPU found - using CPU only")
-
-        # Determinism
-        if self.config.compute.enable_determinism:
-            os.environ['TF_DETERMINISTIC_OPS'] = '1'
-            os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
-            os.environ['TF_CUDNN_USE_AUTOTUNE'] = '0'
-            try:
-                tf.config.experimental.enable_op_determinism()
-                print("✓ Deterministic operations enabled")
-            except Exception as e:
-                print(f"⚠ Could not enable determinism: {e}")
 
         # Mixed precision
         from tensorflow.keras import mixed_precision
@@ -121,6 +133,18 @@ class ScalingLawExperiment:
             f"✓ Precision: {precision_label} "
             f"(policy={active_policy.name}, compute dtype={active_policy.compute_dtype})"
         )
+
+    def _set_random_seeds(self, seed: Optional[int] = None):
+        """Set all Python/NumPy/TensorFlow seeds used by Keras training."""
+        resolved_seed = int(self.config.runtime.random_state if seed is None else seed)
+        random.seed(resolved_seed)
+        np.random.seed(resolved_seed)
+        try:
+            tf.keras.utils.set_random_seed(resolved_seed)
+        except Exception:
+            tf.random.set_seed(resolved_seed)
+        else:
+            tf.random.set_seed(resolved_seed)
 
     @staticmethod
     def make_param_sizes(min_size: int = 1_000, max_size: int = 1_000_000, num: int = 8) -> List[str]:
@@ -720,6 +744,7 @@ class ScalingLawExperiment:
             epochs=fit_epochs,
             batch_size=self.config.training.train_batch_size,
             validation_batch_size=self.config.training.validation_batch_size,
+            shuffle=self.config.training.shuffle,
             verbose=0,
             callbacks=callbacks
         )
@@ -861,6 +886,7 @@ class ScalingLawExperiment:
             'epochs': int(actual_epochs),
             'scheduled_epochs': int(epochs),
             'batch_size': int(self.config.training.train_batch_size),
+            'shuffle': bool(self.config.training.shuffle),
             'learning_rate': float(self.config.training.learning_rate),
             'flops_per_epoch': float(flops_per_epoch),
             'normalization': self.config.architecture.normalization.value,
@@ -880,6 +906,15 @@ class ScalingLawExperiment:
                 'val_loss': val_loss_history,
                 'cumulative_flops': [float(x) for x in cumulative_flops],
                 'cumulative_pf_days': [float(x) for x in cumulative_pf_days]
+            },
+            'compute_config': {
+                'precision': int(self.config.compute.precision),
+                'mixed_precision_policy': (
+                    self.config.compute.mixed_precision_policy
+                    or self.config.compute.resolve_mixed_precision_policy()
+                ),
+                'enable_determinism': bool(self.config.compute.enable_determinism),
+                'allow_tf32': bool(self.config.compute.allow_tf32),
             }
         }
 
@@ -1133,6 +1168,7 @@ class ScalingLawExperiment:
             print(f"Range: {param_sizes_int[0]:,} to {param_sizes_int[-1]:,} parameters")
         print(f"Epochs: {'Variable by size' if callable(self.config.training.epochs) else self.config.training.epochs}")
         print(f"Batch size: {self.config.training.train_batch_size}")
+        print(f"Shuffle training rows: {self.config.training.shuffle}")
         print(f"Learning rate: {self.config.training.learning_rate}")
         print(f"Architecture mode: {self.config.architecture.architecture_mode.value}")
         print(f"Portfolio mode: {portfolio_mode}")
@@ -1150,8 +1186,7 @@ class ScalingLawExperiment:
             existing_model_names = self.results_manager.load_existing_model_names()
 
         # Set random seeds
-        np.random.seed(self.config.runtime.random_state)
-        tf.random.set_seed(self.config.runtime.random_state)
+        self._set_random_seeds()
 
         experiment_start = time.time()
 
@@ -1178,6 +1213,7 @@ class ScalingLawExperiment:
                 MemoryManager.print_memory_usage(f"START model {i + 1}")
 
             try:
+                self._set_random_seeds(self.config.runtime.random_state + i)
                 result = self.train_single_model(
                     X_train, y_train, X_val, y_val, X_test, y_test,
                     target_params=size,

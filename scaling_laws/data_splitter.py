@@ -72,7 +72,7 @@ class DataSplitter:
             target_col,
             date_col,
         )
-        model_data = model_data.sort_values(date_col)
+        model_data = model_data.sort_values(date_col, kind="mergesort")
 
         if mode == SplitMode.DATE_CUTOFFS:
             train_data, val_data, test_data, split_dates = self._split_by_date_cutoffs(
@@ -495,4 +495,3 @@ class DataSplitter:
                 "test_asset_ids length mismatch: "
                 f"test_asset_ids={len(result.test_asset_ids):,}, y_test={len(result.y_test):,}"
             )
-
