@@ -48,6 +48,7 @@ N_FIRMS = 200  # More firms give a larger cross-section each month.
 N_FIRM_CHARS = 64  # More characteristics increase input dimension.
 CHAR_PERSISTENCE = 0.92  # Higher values make characteristics move more slowly.
 RANDOM_STATE = 42  # Change this to draw a different simulated economy.
+VARY_SEED_PER_MODEL = True
 
 # Hidden expected-return controls. Set a strength to 0.0 to remove that block.
 LINEAR_CHAR_COUNT = 64  # More linear chars make the signal more additive.
@@ -410,10 +411,10 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
             use_input_normalization=True,
         ),
         training=TrainingConfig(
-            train_batch_size=65536,
-            prediction_batch_size=65536,
+            train_batch_size=262144,
+            prediction_batch_size=262144,
             shuffle=False,
-            learning_rate=0.01,
+            learning_rate=0.001,
             clip_norm=1.0,
         ),
         scheduler=SchedulerConfig(
@@ -446,17 +447,17 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         runtime=RuntimeConfig(
             resume=ResumeMode.OVERWRITE,
             random_state=RANDOM_STATE,
+            vary_seed_per_model=VARY_SEED_PER_MODEL,
             show_live_plots=True,
             debug_memory=False,
         ),
         compute=ComputeConfig(
             precision=32,
             enable_determinism=True,
-            allow_tf32=False,
+            enable_tensor_float_32=False,
         ),
         annualization=AnnualizationConfig(periods=12),
         param_sizes=[
-            "250",
             "500",
             "1K",
             "5K",
