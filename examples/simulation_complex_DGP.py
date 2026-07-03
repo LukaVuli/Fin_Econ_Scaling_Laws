@@ -458,7 +458,6 @@ def build_config(val_cutoff: str, test_cutoff: str) -> ScalingLawConfig:
         ),
         annualization=AnnualizationConfig(periods=12),
         param_sizes=[
-            "500",
             "1K",
             "5K",
             "10K",
