@@ -201,32 +201,59 @@ class ResultsManager:
         except Exception as e:
             print(f"⚠ Could not update JSON: {e}")
 
-    def save_decile_returns_to_csv(
+    @staticmethod
+    def _sanitize_returns_index(df: pd.DataFrame) -> pd.DataFrame:
+        """Normalize a returns panel's date index before an outer-join merge.
+
+        Guards the two ways a returns CSV can silently corrupt across
+        ``ResumeMode.UPDATE_EXISTING`` reruns:
+
+        * NaT / blank date labels (e.g. an undated portfolio row written as an
+          empty label and read back as NaT). Duplicate NaT labels make an
+          outer ``join`` do a cartesian product, so the tail duplicates and
+          grows on every rerun.
+        * A string / object index (when ``parse_dates`` cannot cleanly parse
+          the column) that will not align with a fresh ``DatetimeIndex``.
+
+        Coerces the index to datetime, drops unparseable / NaT rows, and
+        collapses duplicate labels (keeping the last) so the join stays 1:1.
+        """
+        idx = pd.to_datetime(df.index, errors='coerce')
+        df = df.set_axis(idx, axis=0)
+        df = df[df.index.notna()]
+        df = df[~df.index.duplicated(keep='last')]
+        df.index.name = 'date'
+        return df
+
+    def _save_returns_to_csv(
             self,
-            decile_returns: pd.DataFrame,
+            returns_df: pd.DataFrame,
             model_identifier: str
     ):
-        """
-        Save decile returns to CSV file.
+        """Merge a model's returns columns into the shared returns CSV.
 
-        Args:
-            decile_returns: DataFrame with decile returns
-            model_identifier: Identifier for the model
+        Shared implementation for the panel (decile) and time-series writers.
+        Columns are namespaced by ``model_identifier`` and merged onto any
+        existing on-disk panel with a date-aligned outer join. Both sides are
+        passed through :meth:`_sanitize_returns_index` first so an
+        ``UPDATE_EXISTING`` rerun cannot accumulate a duplicated tail.
         """
         if not self.config.output.save_csv:
             return
 
         new_data = {}
-        for col in decile_returns.columns:
+        for col in returns_df.columns:
             col_name = f"{model_identifier}_{col}"
-            new_data[col_name] = decile_returns[col].values
+            new_data[col_name] = returns_df[col].values
 
-        new_df = pd.DataFrame(new_data, index=decile_returns.index)
+        new_df = pd.DataFrame(new_data, index=returns_df.index)
         new_df.index.name = 'date'
+        new_df = self._sanitize_returns_index(new_df)
 
         if self.csv_path.exists():
             try:
                 existing_df = pd.read_csv(self.csv_path, index_col='date', parse_dates=True)
+                existing_df = self._sanitize_returns_index(existing_df)
 
                 cols_to_remove = [c for c in existing_df.columns
                                   if c.startswith(f"{model_identifier}_")]
@@ -234,7 +261,7 @@ class ResultsManager:
                     existing_df = existing_df.drop(columns=cols_to_remove)
                     print(f"  ↻ Replacing existing CSV columns for {model_identifier}")
 
-                combined_df = existing_df.join(new_df, how='outer')
+                combined_df = existing_df.join(new_df, how='outer').sort_index()
                 self.csv_path.parent.mkdir(parents=True, exist_ok=True)
                 combined_df.to_csv(self.csv_path)
 
@@ -250,6 +277,20 @@ class ResultsManager:
 
         del new_df
         gc.collect()
+
+    def save_decile_returns_to_csv(
+            self,
+            decile_returns: pd.DataFrame,
+            model_identifier: str
+    ):
+        """
+        Save decile returns to CSV file.
+
+        Args:
+            decile_returns: DataFrame with decile returns
+            model_identifier: Identifier for the model
+        """
+        self._save_returns_to_csv(decile_returns, model_identifier)
 
     def save_ts_returns_to_csv(
             self,
@@ -263,43 +304,7 @@ class ResultsManager:
             ts_returns: DataFrame with time-series strategy returns
             model_identifier: Identifier for the model
         """
-        if not self.config.output.save_csv:
-            return
-
-        new_data = {}
-        for col in ts_returns.columns:
-            col_name = f"{model_identifier}_{col}"
-            new_data[col_name] = ts_returns[col].values
-
-        new_df = pd.DataFrame(new_data, index=ts_returns.index)
-        new_df.index.name = 'date'
-
-        if self.csv_path.exists():
-            try:
-                existing_df = pd.read_csv(self.csv_path, index_col='date', parse_dates=True)
-
-                cols_to_remove = [c for c in existing_df.columns
-                                  if c.startswith(f"{model_identifier}_")]
-                if cols_to_remove:
-                    existing_df = existing_df.drop(columns=cols_to_remove)
-                    print(f"  ↻ Replacing existing CSV columns for {model_identifier}")
-
-                combined_df = existing_df.join(new_df, how='outer')
-                self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-                combined_df.to_csv(self.csv_path)
-
-                del existing_df
-                del combined_df
-            except Exception as e:
-                print(f"⚠ Error updating CSV, overwriting: {e}")
-                self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-                new_df.to_csv(self.csv_path)
-        else:
-            self.csv_path.parent.mkdir(parents=True, exist_ok=True)
-            new_df.to_csv(self.csv_path)
-
-        del new_df
-        gc.collect()
+        self._save_returns_to_csv(ts_returns, model_identifier)
 
     def load_results(self) -> List[Dict[str, Any]]:
         """Load all results from pickle file."""
