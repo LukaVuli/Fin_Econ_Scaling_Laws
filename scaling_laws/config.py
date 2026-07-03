@@ -288,7 +288,7 @@ class ComputeConfig:
             train_samples: int,
             input_dim: int,
             architecture: List[int],
-            model: Model
+            model: Any
     ) -> Union[int, float]:
         """Estimate per-epoch FLOPs, preserving the historical default formula."""
         if self.flop_estimator is None:
