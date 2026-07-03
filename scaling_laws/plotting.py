@@ -59,17 +59,27 @@ class ScalingLawPlotter:
 
         # Convert MSE to RMSE*100 for all loss metrics
         # Convert R² to percentage
+        # Top-level loss scalars converted to RMSE*100 (the training_curve
+        # copies are converted separately below — do not double-convert).
+        loss_keys = ('train_loss', 'val_loss', 'test_loss')
+        # Every R² family scalar is converted to a percentage, like the
+        # legacy val_r2/test_r2 keys.
+        r2_keys = (
+            'test_r2', 'val_r2',
+            'train_square_corr', 'train_r2_zero', 'train_r2_histmean', 'train_r2_classic',
+            'val_square_corr', 'val_r2_zero', 'val_r2_histmean', 'val_r2_classic',
+            'test_square_corr', 'test_r2_zero', 'test_r2_histmean', 'test_r2_classic',
+        )
         for r in results:
             # Convert top-level loss metrics
-            if 'test_loss' in r:
-                original = r['test_loss']
-                r['test_loss'] = np.sqrt(r['test_loss']) * 100
+            for k in loss_keys:
+                if k in r:
+                    r[k] = np.sqrt(r[k]) * 100
 
             # Convert R² to percentage
-            if 'test_r2' in r:
-                r['test_r2'] = r['test_r2'] * 100
-            if 'val_r2' in r:
-                r['val_r2'] = r['val_r2'] * 100
+            for k in r2_keys:
+                if k in r:
+                    r[k] = r[k] * 100
 
             # Convert training curve losses
             if 'training_curve' in r:
@@ -397,12 +407,23 @@ class ScalingLawPlotter:
         cbar = plt.colorbar(scatter, ax=ax, pad=0.02)
         cbar.set_label('Parameters', rotation=270, labelpad=25, fontsize=14, fontweight='bold')
 
-        if fit_curve and len(x_data) > 3 and metric == 'test_loss':
+        # Any '*_loss' metric is treated as a loss (log y-scale + decreasing
+        # fit); any R² family metric (square_corr / r2_zero / r2_histmean /
+        # r2_classic for any sample, plus legacy val_r2/test_r2) is treated
+        # as an R² metric (increasing fit).
+        is_loss_metric = metric.endswith('_loss')
+        r2_family_suffixes = ('square_corr', 'r2_zero', 'r2_histmean', 'r2_classic')
+        is_r2_metric = (
+            metric in ('test_r2', 'val_r2')
+            or any(metric.endswith(suffix) for suffix in r2_family_suffixes)
+        )
+
+        if fit_curve and len(x_data) > 3 and is_loss_metric:
             self._fit_and_plot_scaling_law(
                 ax, x_data, metric_values, x_var=x_var,
                 use_compute_weighting=use_compute_weighting
             )
-        elif fit_curve and len(x_data) > 3 and metric in ('test_r2', 'val_r2'):
+        elif fit_curve and len(x_data) > 3 and is_r2_metric:
             self._fit_and_plot_scaling_law(
                 ax, x_data, metric_values, x_var=x_var,
                 use_compute_weighting=use_compute_weighting,
@@ -410,16 +431,34 @@ class ScalingLawPlotter:
             )
 
         ax.set_xscale('log')
-        if metric == 'test_loss':
+        if is_loss_metric:
             ax.set_yscale('log')
 
         ax.set_xlabel(x_label, fontsize=16, fontweight='bold')
 
-        metric_labels = {'test_loss': 'Test Loss (RMSE in Percent)', 'test_r2': 'Test R² (%)', 'val_r2': 'Validation R² (%)'}
-        ax.set_ylabel(metric_labels[metric], fontsize=16, fontweight='bold')
+        metric_labels = {
+            'train_loss': 'Train Loss (RMSE in Percent)',
+            'val_loss': 'Validation Loss (RMSE in Percent)',
+            'test_loss': 'Test Loss (RMSE in Percent)',
+            'test_r2': 'Test R² (%)',
+            'val_r2': 'Validation R² (%)',
+            'train_square_corr': 'Train Square Correlation (%)',
+            'train_r2_zero': 'Train R² (zero benchmark) (%)',
+            'train_r2_histmean': 'Train R² (historical mean) (%)',
+            'train_r2_classic': 'Train R² (classic) (%)',
+            'val_square_corr': 'Validation Square Correlation (%)',
+            'val_r2_zero': 'Validation R² (zero benchmark) (%)',
+            'val_r2_histmean': 'Validation R² (historical mean) (%)',
+            'val_r2_classic': 'Validation R² (classic) (%)',
+            'test_square_corr': 'Test Square Correlation (%)',
+            'test_r2_zero': 'Test R² (zero benchmark) (%)',
+            'test_r2_histmean': 'Test R² (historical mean) (%)',
+            'test_r2_classic': 'Test R² (classic) (%)',
+        }
+        ax.set_ylabel(metric_labels.get(metric, metric), fontsize=16, fontweight='bold')
 
         if title is None:
-            title = f'{metric_labels[metric]} vs Model Size'
+            title = f'{metric_labels.get(metric, metric)} vs Model Size'
         ax.set_title(title, fontsize=18, fontweight='bold', pad=20)
 
         ax.grid(True, alpha=0.3, linestyle='--')
@@ -587,7 +626,35 @@ class ScalingLawPlotter:
             use_compute_weighting=use_compute_weighting
         )
 
-        print("\n5. Sharpe Ratio Forecast-Weighted vs Compute")
+        # Full loss family (train/val/test) plus the four R² families for
+        # each of train/val/test — 3 loss plots + 12 R² plots.
+        extra_metrics = [
+            ('train_loss', 'train_loss_vs_compute.png'),
+            ('val_loss', 'val_loss_vs_compute.png'),
+            ('train_square_corr', 'train_square_corr_vs_compute.png'),
+            ('val_square_corr', 'val_square_corr_vs_compute.png'),
+            ('test_square_corr', 'test_square_corr_vs_compute.png'),
+            ('train_r2_zero', 'train_r2_zero_vs_compute.png'),
+            ('val_r2_zero', 'val_r2_zero_vs_compute.png'),
+            ('test_r2_zero', 'test_r2_zero_vs_compute.png'),
+            ('train_r2_histmean', 'train_r2_histmean_vs_compute.png'),
+            ('val_r2_histmean', 'val_r2_histmean_vs_compute.png'),
+            ('test_r2_histmean', 'test_r2_histmean_vs_compute.png'),
+            ('train_r2_classic', 'train_r2_classic_vs_compute.png'),
+            ('val_r2_classic', 'val_r2_classic_vs_compute.png'),
+            ('test_r2_classic', 'test_r2_classic_vs_compute.png'),
+        ]
+        for idx, (metric_name, save_name) in enumerate(extra_metrics, start=5):
+            print(f"\n{idx}. {metric_name} vs Compute")
+            self.plot_final_performance(
+                metric=metric_name,
+                x_axis='compute',
+                save_name=save_name,
+                dpi=dpi,
+                use_compute_weighting=use_compute_weighting
+            )
+
+        print("\nSharpe Ratio Forecast-Weighted vs Compute")
         self.plot_sharpe_ratio_scaling(
             portfolio='Forecast_Weighted',
             x_axis='compute',
@@ -596,7 +663,7 @@ class ScalingLawPlotter:
         )
 
         if include_ls_breakpoints:
-            print("\n6. Sharpe Ratio LS50 vs Compute")
+            print("\nSharpe Ratio LS50 vs Compute")
             self.plot_sharpe_ratio_scaling(
                 breakpoint='50',
                 x_axis='compute',
@@ -604,7 +671,7 @@ class ScalingLawPlotter:
                 use_compute_weighting=use_compute_weighting
             )
 
-            print("\n7. Sharpe Ratio LS30 vs Compute")
+            print("\nSharpe Ratio LS30 vs Compute")
             self.plot_sharpe_ratio_scaling(
                 breakpoint='30',
                 x_axis='compute',
@@ -612,7 +679,7 @@ class ScalingLawPlotter:
                 use_compute_weighting=use_compute_weighting
             )
 
-            print("\n8. Sharpe Ratio LS10 vs Compute")
+            print("\nSharpe Ratio LS10 vs Compute")
             self.plot_sharpe_ratio_scaling(
                 breakpoint='10',
                 x_axis='compute',

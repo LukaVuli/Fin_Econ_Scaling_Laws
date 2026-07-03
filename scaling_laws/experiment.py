@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import platform
 import pickle
 import random
 import time
@@ -14,6 +15,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+
+# These environment variables are read by parts of the TensorFlow CUDA stack
+# during import/initialization. The ComputeConfig still calls the runtime API,
+# but set reproducibility-first defaults before importing TensorFlow.
+os.environ.setdefault('TF_DETERMINISTIC_OPS', '1')
+os.environ.setdefault('TF_CUDNN_DETERMINISTIC', '1')
+os.environ.setdefault('TF_CUDNN_USE_AUTOTUNE', '0')
+
 import tensorflow as tf
 from tensorflow.keras.callbacks import ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
@@ -23,6 +32,7 @@ from .callbacks import (
     LivePlotCallback,
     R2PercentMetric,
     SingleLineProgressCallback,
+    compute_r2_ylim,
 )
 from .config import (
     BenchmarkConfig,
@@ -31,13 +41,88 @@ from .config import (
     TSStrategyConfig,
 )
 from .data_splitter import DataSplitResult, DataSplitter
-from .enums import PortfolioMode, ResumeMode, VALID_BENCHMARK_MODES
+from .enums import PortfolioMode, R2_FAMILY_LABELS, ResumeMode, VALID_BENCHMARK_MODES
 from .model_builder import ModelBuilder
 from .plotting import ScalingLawPlotter
 from .portfolio import PortfolioAnalyzer
 from .results import ResultsManager
 from .utils.format import format_params, parse_size
 from .utils.memory import MemoryManager
+
+
+def _compute_r2_family(y, yhat, hist) -> Dict[str, float]:
+    """Compute the four R² families for a (y, yhat) pair.
+
+    Returns a dict with keys square_corr, r2_zero, r2_histmean, r2_classic.
+    All denominators are guarded against zero / non-finite: a metric whose
+    denominator is 0 (or whose inputs make it ill-defined) is returned as
+    ``float('nan')`` rather than raising. Computation is done in float64 and
+    outputs are cast to plain python floats.
+    """
+    y = np.asarray(y, dtype=np.float64).ravel()
+    yhat = np.asarray(yhat, dtype=np.float64).ravel()
+    hist = np.asarray(hist, dtype=np.float64).ravel()
+
+    nan = float('nan')
+
+    sse = float(np.sum((y - yhat) ** 2))
+
+    # Square correlation: cov(y, yhat)^2 / (var(y) * var(yhat)), as a fraction.
+    if y.size < 2:
+        square_corr = nan
+    else:
+        var_y = float(np.var(y))
+        var_yhat = float(np.var(yhat))
+        denom_sc = var_y * var_yhat
+        if not np.isfinite(denom_sc) or denom_sc == 0.0:
+            square_corr = nan
+        else:
+            cov = float(np.mean((y - np.mean(y)) * (yhat - np.mean(yhat))))
+            square_corr = (cov ** 2) / denom_sc
+            if not np.isfinite(square_corr):
+                square_corr = nan
+
+    # r2_zero = 1 - SSE / sum(y^2)
+    denom_zero = float(np.sum(y ** 2))
+    if not np.isfinite(denom_zero) or denom_zero == 0.0:
+        r2_zero = nan
+    else:
+        r2_zero = 1.0 - sse / denom_zero
+        if not np.isfinite(r2_zero):
+            r2_zero = nan
+
+    # r2_histmean = 1 - SSE / sum((y - ybar_hist)^2)
+    if hist.size == 0:
+        r2_histmean = nan
+    else:
+        ybar_hist = float(np.mean(hist))
+        denom_hist = float(np.sum((y - ybar_hist) ** 2))
+        if not np.isfinite(denom_hist) or denom_hist == 0.0:
+            r2_histmean = nan
+        else:
+            r2_histmean = 1.0 - sse / denom_hist
+            if not np.isfinite(r2_histmean):
+                r2_histmean = nan
+
+    # r2_classic = 1 - SSE / sum((y - ybar_eval)^2)
+    if y.size == 0:
+        r2_classic = nan
+    else:
+        ybar_eval = float(np.mean(y))
+        denom_classic = float(np.sum((y - ybar_eval) ** 2))
+        if not np.isfinite(denom_classic) or denom_classic == 0.0:
+            r2_classic = nan
+        else:
+            r2_classic = 1.0 - sse / denom_classic
+            if not np.isfinite(r2_classic):
+                r2_classic = nan
+
+    return {
+        'square_corr': float(square_corr),
+        'r2_zero': float(r2_zero),
+        'r2_histmean': float(r2_histmean),
+        'r2_classic': float(r2_classic),
+    }
 
 
 class ScalingLawExperiment:
@@ -74,27 +159,7 @@ class ScalingLawExperiment:
 
     def _configure_tensorflow(self):
         """Configure TensorFlow settings based on configuration."""
-        # Determinism
-        if self.config.compute.enable_determinism:
-            os.environ['TF_DETERMINISTIC_OPS'] = '1'
-            os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
-            os.environ['TF_CUDNN_USE_AUTOTUNE'] = '0'
-            try:
-                tf.config.experimental.enable_op_determinism()
-                print("✓ Deterministic operations enabled")
-            except Exception as e:
-                print(f"⚠ Could not enable determinism: {e}")
-
-        try:
-            tf.config.experimental.enable_tensor_float_32_execution(
-                bool(self.config.compute.allow_tf32)
-            )
-            print(
-                "✓ NVIDIA TF32 matrix math: "
-                f"{'enabled' if self.config.compute.allow_tf32 else 'disabled'}"
-            )
-        except Exception as e:
-            print(f"⚠ Could not configure NVIDIA TF32 behavior: {e}")
+        self._set_random_seeds()
 
         # GPU configuration
         gpus = tf.config.list_physical_devices('GPU')
@@ -107,6 +172,29 @@ class ScalingLawExperiment:
                 print(f"GPU configuration error: {e}")
         else:
             print("⚠ No GPU found - using CPU only")
+
+        # Determinism
+        if self.config.compute.enable_determinism:
+            os.environ['TF_DETERMINISTIC_OPS'] = '1'
+            os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+            os.environ['TF_CUDNN_USE_AUTOTUNE'] = '0'
+            try:
+                tf.config.experimental.enable_op_determinism()
+                print("✓ Deterministic operations enabled")
+            except Exception as e:
+                print(f"⚠ Could not enable determinism: {e}")
+
+        # NVIDIA Ampere+ defaults may use TF32 for float32 matmul/convolution.
+        # That is fast, but it is not numerically equivalent to CPU/Metal
+        # float32. Keep it opt-in for reproducibility-sensitive sweeps.
+        try:
+            tf.config.experimental.enable_tensor_float_32_execution(
+                self.config.compute.enable_tensor_float_32
+            )
+            tf32_state = "enabled" if self.config.compute.enable_tensor_float_32 else "disabled"
+            print(f"✓ TensorFloat-32 execution: {tf32_state}")
+        except Exception as e:
+            print(f"⚠ Could not configure TensorFloat-32 execution: {e}")
 
         # Mixed precision
         from tensorflow.keras import mixed_precision
@@ -135,16 +223,84 @@ class ScalingLawExperiment:
         )
 
     def _set_random_seeds(self, seed: Optional[int] = None):
-        """Set all Python/NumPy/TensorFlow seeds used by Keras training."""
+        """Seed Python, NumPy, and TensorFlow.
+
+        ``seed=None`` uses ``runtime.random_state``. Callers pass an explicit
+        per-model seed when ``runtime.vary_seed_per_model`` is enabled.
+        """
         resolved_seed = int(self.config.runtime.random_state if seed is None else seed)
+        os.environ['PYTHONHASHSEED'] = str(resolved_seed)
         random.seed(resolved_seed)
         np.random.seed(resolved_seed)
         try:
             tf.keras.utils.set_random_seed(resolved_seed)
         except Exception:
             tf.random.set_seed(resolved_seed)
-        else:
-            tf.random.set_seed(resolved_seed)
+
+    @staticmethod
+    def _adapt_input_normalizer(normalizer, X_train: np.ndarray):
+        """Adapt Keras Normalization deterministically from NumPy float64 stats.
+
+        ``Normalization.adapt`` reduces on the active TensorFlow backend. That is
+        usually fine, but for cross-device forensic runs we want the same input
+        mean/variance independent of CUDA vs Metal reduction order.
+        """
+        mean = np.mean(X_train, axis=0, dtype=np.float64).astype(np.float32)
+        variance = np.var(X_train, axis=0, dtype=np.float64).astype(np.float32)
+
+        try:
+            weights = normalizer.get_weights()
+            if len(weights) >= 2:
+                adapted = [
+                    mean.reshape(weights[0].shape).astype(weights[0].dtype, copy=False),
+                    variance.reshape(weights[1].shape).astype(weights[1].dtype, copy=False),
+                ]
+                if len(weights) >= 3:
+                    count = np.asarray(X_train.shape[0], dtype=weights[2].dtype)
+                    adapted.append(count.reshape(weights[2].shape))
+                normalizer.set_weights(adapted)
+                return
+        except Exception as exc:
+            print(f"⚠ NumPy normalizer adaptation failed; falling back to Keras adapt: {exc}")
+
+        normalizer.adapt(X_train)
+
+    @staticmethod
+    def _tensorflow_runtime_info() -> Dict[str, Any]:
+        """Collect TensorFlow/backend metadata for comparing runs."""
+        try:
+            build_info = tf.sysconfig.get_build_info()
+        except Exception:
+            build_info = {}
+        try:
+            gpus = [device.name for device in tf.config.list_physical_devices('GPU')]
+        except Exception:
+            gpus = []
+        try:
+            from tensorflow.keras import mixed_precision
+            policy = mixed_precision.global_policy()
+            policy_name = policy.name
+            compute_dtype = policy.compute_dtype
+            variable_dtype = policy.variable_dtype
+        except Exception:
+            policy_name = compute_dtype = variable_dtype = None
+        try:
+            tf32_enabled = bool(tf.config.experimental.tensor_float_32_execution_enabled())
+        except Exception:
+            tf32_enabled = None
+
+        return {
+            'python_version': platform.python_version(),
+            'platform': platform.platform(),
+            'tensorflow_version': tf.__version__,
+            'keras_version': getattr(tf.keras, '__version__', None),
+            'gpu_devices': gpus,
+            'build_info': build_info,
+            'mixed_precision_policy': policy_name,
+            'mixed_precision_compute_dtype': compute_dtype,
+            'mixed_precision_variable_dtype': variable_dtype,
+            'tensor_float_32_enabled': tf32_enabled,
+        }
 
     @staticmethod
     def make_param_sizes(min_size: int = 1_000, max_size: int = 1_000_000, num: int = 8) -> List[str]:
@@ -528,25 +684,28 @@ class ScalingLawExperiment:
             ax.set_xlim(-0.5, max(epochs_list[-1], 1) + 0.5)
 
         if plot_r2:
+            # Label / axis-bounding follow the configured R² family so the saved
+            # PNG matches the live plot (square_corr is bounded [0,1]; the
+            # R²-style families get the robust, asymmetric y-axis).
+            r2_family = self.config.runtime.live_r2_metric
+            r2_label = R2_FAMILY_LABELS.get(r2_family, "R²")
+            r2_bounded = (r2_family == "square_corr")
             ax_r2 = ax.twinx()
             train_r2_line, = ax_r2.plot(epochs_list, r2_values, 'b--',
-                                        label='Training R²', linewidth=2)
+                                        label=f'Train {r2_label}', linewidth=2)
             val_r2_line, = ax_r2.plot(epochs_list, val_r2_values, 'r--',
-                                      label='Validation R²', linewidth=2)
-            ax_r2.set_ylabel('R² (%)')
-            finite_r2 = [v for v in (*r2_values, *val_r2_values)
-                         if v is not None and np.isfinite(v)]
-            if finite_r2:
-                r2min = min(finite_r2)
-                r2max = max(finite_r2)
-                if r2min == r2max:
-                    r2min, r2max = r2min - 1.0, r2max + 1.0
-                pad = max((r2max - r2min) * 0.1, 0.1)
-                ax_r2.set_ylim(r2min - pad, r2max + pad)
+                                      label=f'Val {r2_label}', linewidth=2)
+            ax_r2.set_ylabel(f'{r2_label} (%)')
+            ylim = compute_r2_ylim(
+                [r2_values, val_r2_values], r2_bounded,
+                floor=self.config.runtime.live_r2_floor,
+            )
+            if ylim is not None:
+                ax_r2.set_ylim(*ylim)
             ax.legend(
                 [train_line, val_line, train_r2_line, val_r2_line],
                 ['Training Loss', 'Validation Loss',
-                 'Training R²', 'Validation R²'],
+                 f'Train {r2_label}', f'Val {r2_label}'],
                 loc='upper left',
             )
         else:
@@ -579,7 +738,8 @@ class ScalingLawExperiment:
             portfolio: str = "panel",
             kappa: Optional[float] = None,
             benchmark: Optional[Union[str, Callable[..., Any], BenchmarkConfig]] = None,
-            asset_ids: Optional[np.ndarray] = None
+            asset_ids: Optional[np.ndarray] = None,
+            seed: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Train a single model and return comprehensive results.
@@ -635,8 +795,13 @@ class ScalingLawExperiment:
         effective_portfolio_config = PortfolioConfig(
             mode=portfolio,
             asset_id_col=self.config.portfolio.asset_id_col,
+            enabled=self.config.portfolio.enabled,
         )
         portfolio_mode = effective_portfolio_config.mode.value
+        portfolio_enabled = (
+            effective_portfolio_config.enabled
+            and effective_portfolio_config.mode.value != "none"
+        )
 
         print(f"\n{'=' * 80}")
         print(f"MODEL: {model_name} | Target: {target_params:,} parameters")
@@ -647,6 +812,7 @@ class ScalingLawExperiment:
 
         # Aggressive cleanup before building
         MemoryManager.aggressive_cleanup()
+        self._set_random_seeds(seed)
 
         if self.config.runtime.debug_memory:
             MemoryManager.print_memory_usage("AFTER initial cleanup")
@@ -657,7 +823,7 @@ class ScalingLawExperiment:
         )
 
         if normalizer is not None:
-            normalizer.adapt(X_train)
+            self._adapt_input_normalizer(normalizer, X_train)
 
         print(f"Architecture: {architecture}")
         print(f"Actual parameters: {actual_params:,}")
@@ -677,10 +843,20 @@ class ScalingLawExperiment:
         else:
             optimizer = Adam(learning_rate=self.config.training.learning_rate)
 
+        # The live plot and the fuzzy-stop monitor both read the per-epoch
+        # `r2_percent` / `val_r2_percent` logs. Stream the user-selected R²
+        # family under those names so a single config knob drives both. The
+        # historical-mean baseline is the train mean of Y (the leakage-safe
+        # convention used post-hoc in _compute_r2_family for the val split).
+        live_r2_family = self.config.runtime.live_r2_metric
+        hist_baseline = float(np.mean(np.asarray(y_train, dtype=np.float64)))
         model.compile(
             loss='mean_squared_error',
             optimizer=optimizer,
-            metrics=[R2PercentMetric()]
+            metrics=[R2PercentMetric(
+                family=live_r2_family,
+                hist_baseline=hist_baseline,
+            )]
         )
 
         # Setup callbacks
@@ -702,6 +878,9 @@ class ScalingLawExperiment:
             live_plot = LivePlotCallback(
                 show_r2=self.config.runtime.show_live_r2,
                 target_params=target_params,
+                r2_label=R2_FAMILY_LABELS.get(live_r2_family, "R²"),
+                r2_bounded=(live_r2_family == "square_corr"),
+                r2_floor=self.config.runtime.live_r2_floor,
             )
             callbacks.append(live_plot)
 
@@ -787,6 +966,12 @@ class ScalingLawExperiment:
             verbose=0
         ).flatten()
 
+        train_pred = model.predict(
+            X_train,
+            batch_size=self.config.training.prediction_batch_size,
+            verbose=0
+        ).flatten()
+
         # Prediction diagnostics
         pred_std = float(np.std(test_pred))
         pred_mean = float(np.mean(test_pred))
@@ -814,6 +999,13 @@ class ScalingLawExperiment:
         ss_tot = np.sum((y_test - expanding_means) ** 2)
         test_r2 = float(1 - (ss_res / ss_tot))
 
+        # Four R² families for each of train / val / test. The "history" used
+        # for the histmean variant is the data available before that split:
+        # train uses y_train, val uses y_train, test uses [y_train, y_val].
+        train_r2_family = _compute_r2_family(y_train, train_pred, y_train)
+        val_r2_family = _compute_r2_family(y_val, val_pred, y_train)
+        test_r2_family = _compute_r2_family(y_test, test_pred, historical_returns)
+
         if live_plot is not None:
             live_plot.cleanup()
             del live_plot
@@ -829,7 +1021,7 @@ class ScalingLawExperiment:
         decile_returns_df = None
         ts_returns_df = None
 
-        if test_dates is not None:
+        if test_dates is not None and portfolio_enabled:
             if portfolio_mode == "panel":
                 portfolio_stats, decile_returns_df = PortfolioAnalyzer.analyze_predictions(
                     test_dates,
@@ -864,6 +1056,25 @@ class ScalingLawExperiment:
         print("R2 Metrics")
         print(f"  Validation R2:    {val_r2:.4f}")
         print(f"  Test R2:          {test_r2:.4f}")
+        print("R2 Families (Square Corr / zero / histmean / classic)")
+        print(
+            f"  Train: {train_r2_family['square_corr']:.4f} / "
+            f"{train_r2_family['r2_zero']:.4f} / "
+            f"{train_r2_family['r2_histmean']:.4f} / "
+            f"{train_r2_family['r2_classic']:.4f}"
+        )
+        print(
+            f"  Val:   {val_r2_family['square_corr']:.4f} / "
+            f"{val_r2_family['r2_zero']:.4f} / "
+            f"{val_r2_family['r2_histmean']:.4f} / "
+            f"{val_r2_family['r2_classic']:.4f}"
+        )
+        print(
+            f"  Test:  {test_r2_family['square_corr']:.4f} / "
+            f"{test_r2_family['r2_zero']:.4f} / "
+            f"{test_r2_family['r2_histmean']:.4f} / "
+            f"{test_r2_family['r2_classic']:.4f}"
+        )
         print("Runtime and Compute")
         print(f"  Training Time:    {train_time:.1f}s")
         print(f"  Total Compute:    {total_pf_days:.2e} PF-days")
@@ -880,6 +1091,18 @@ class ScalingLawExperiment:
             'test_loss': test_mse,
             'val_r2': val_r2,
             'test_r2': test_r2,
+            'train_square_corr': train_r2_family['square_corr'],
+            'train_r2_zero': train_r2_family['r2_zero'],
+            'train_r2_histmean': train_r2_family['r2_histmean'],
+            'train_r2_classic': train_r2_family['r2_classic'],
+            'val_square_corr': val_r2_family['square_corr'],
+            'val_r2_zero': val_r2_family['r2_zero'],
+            'val_r2_histmean': val_r2_family['r2_histmean'],
+            'val_r2_classic': val_r2_family['r2_classic'],
+            'test_square_corr': test_r2_family['square_corr'],
+            'test_r2_zero': test_r2_family['r2_zero'],
+            'test_r2_histmean': test_r2_family['r2_histmean'],
+            'test_r2_classic': test_r2_family['r2_classic'],
             'train_time': float(train_time),
             'total_flops': float(total_flops),
             'pf_days': float(total_pf_days),
@@ -891,6 +1114,8 @@ class ScalingLawExperiment:
             'flops_per_epoch': float(flops_per_epoch),
             'normalization': self.config.architecture.normalization.value,
             'architecture_mode': self.config.architecture.architecture_mode.value,
+            'compute_config': ScalingLawConfig._serialize_value(self.config.compute),
+            'tensorflow_runtime': self._tensorflow_runtime_info(),
             'portfolio_mode': portfolio_mode,
             'benchmark': self._benchmark_display_name(effective_benchmark),
             'benchmark_config': {
@@ -906,15 +1131,6 @@ class ScalingLawExperiment:
                 'val_loss': val_loss_history,
                 'cumulative_flops': [float(x) for x in cumulative_flops],
                 'cumulative_pf_days': [float(x) for x in cumulative_pf_days]
-            },
-            'compute_config': {
-                'precision': int(self.config.compute.precision),
-                'mixed_precision_policy': (
-                    self.config.compute.mixed_precision_policy
-                    or self.config.compute.resolve_mixed_precision_policy()
-                ),
-                'enable_determinism': bool(self.config.compute.enable_determinism),
-                'allow_tf32': bool(self.config.compute.allow_tf32),
             }
         }
 
@@ -1023,7 +1239,7 @@ class ScalingLawExperiment:
         )
         self._last_split_result = split_result
 
-        if split_result.test_sample is not None:
+        if self.config.output.save_test_sample and split_result.test_sample is not None:
             test_sample_path = self.results_manager.save_test_sample(split_result.test_sample)
             print(f"Saved test sample: {len(split_result.X_test):,} obs → {test_sample_path}")
 
@@ -1138,8 +1354,8 @@ class ScalingLawExperiment:
         effective_kappa = self.config.ts_strategy.kappa if kappa is None else float(kappa)
 
         # Validate portfolio mode
-        if portfolio_mode not in ["panel", "ts"]:
-            raise ValueError(f"portfolio must be 'panel' or 'ts', got '{portfolio_mode}'")
+        if portfolio_mode not in ["panel", "ts", "none"]:
+            raise ValueError(f"portfolio must be 'panel', 'ts', or 'none', got '{portfolio_mode}'")
 
         if isinstance(effective_benchmark.mode, str) and effective_benchmark.mode not in VALID_BENCHMARK_MODES:
             raise ValueError(
@@ -1196,6 +1412,8 @@ class ScalingLawExperiment:
         for i, size in enumerate(param_sizes_int):
             model_epochs = self.config.get_epochs(size)
             model_name_str = f"model_{size}"
+            if self.config.runtime.model_name_prefix:
+                model_name_str = f"{self.config.runtime.model_name_prefix}_{model_name_str}"
             if self.config.runtime.run_name:
                 model_name_str += f"_{self.config.runtime.run_name}"
 
@@ -1213,7 +1431,11 @@ class ScalingLawExperiment:
                 MemoryManager.print_memory_usage(f"START model {i + 1}")
 
             try:
-                self._set_random_seeds(self.config.runtime.random_state + i)
+                model_seed = (
+                    self.config.runtime.random_state + i
+                    if self.config.runtime.vary_seed_per_model
+                    else None
+                )
                 result = self.train_single_model(
                     X_train, y_train, X_val, y_val, X_test, y_test,
                     target_params=size,
@@ -1224,6 +1446,7 @@ class ScalingLawExperiment:
                     kappa=kappa,
                     benchmark=effective_benchmark,
                     asset_ids=asset_ids,
+                    seed=model_seed,
                 )
 
                 # Handle portfolio returns based on mode

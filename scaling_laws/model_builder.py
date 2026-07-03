@@ -49,9 +49,19 @@ class ModelBuilder:
         """Get deterministic per-layer seeds from the configured base seed."""
         return int(self.config.runtime.random_state) + layer_index
 
-    def _get_output_initializer(self, layer_count: int):
-        """Use Keras' default output initializer, but with an explicit seed."""
-        return GlorotUniform(seed=self._get_layer_seed(layer_count))
+    def _get_output_initializer(self, layer_index: int):
+        """Seed the output layer initializer explicitly.
+
+        Hidden layers already receive deterministic per-layer seeds. The final
+        Dense layer uses Keras' Glorot default, so give it its own seed too
+        instead of letting it consume backend/global RNG state.
+        """
+        return GlorotUniform(seed=self._get_layer_seed(layer_index))
+
+    def _get_output_dtype(self):
+        """Keep regression outputs/losses in float32 under mixed precision."""
+        policy = self.config.compute.resolve_mixed_precision_policy()
+        return "float32" if str(policy).startswith("mixed_") else None
 
     def _add_normalization(self, x, layer_index: int):
         """Add normalization layer based on configuration."""
@@ -146,6 +156,7 @@ class ModelBuilder:
             self.config.architecture.output_units,
             activation=self.config.architecture.output_activation,
             kernel_initializer=self._get_output_initializer(len(layers_config)),
+            dtype=self._get_output_dtype(),
         )(x)
         model = Model(inputs=inputs, outputs=outputs)
 
@@ -238,6 +249,7 @@ class ModelBuilder:
             self.config.architecture.output_units,
             activation=self.config.architecture.output_activation,
             kernel_initializer=self._get_output_initializer(n_layers),
+            dtype=self._get_output_dtype(),
         )(x)
         model = Model(inputs=inputs, outputs=outputs)
 

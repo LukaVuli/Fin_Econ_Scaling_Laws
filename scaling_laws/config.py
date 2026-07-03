@@ -12,7 +12,6 @@ from typing import Any, Callable, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from tensorflow.keras.models import Model
 
 from .enums import (
     ArchitectureMode,
@@ -20,6 +19,7 @@ from .enums import (
     MissingDataPolicy,
     NormalizationType,
     PortfolioMode,
+    R2_FAMILIES,
     ResumeMode,
     SplitMode,
     VALID_BENCHMARK_MODES,
@@ -46,7 +46,7 @@ def default_taper_schedule(target_params: int) -> List[float]:
 
 def default_epochs_schedule(size: int) -> int:
     """Default epochs schedule. `size` is the model parameter count."""
-    return max(int(0.75 * (size ** 0.75)), 1) + 100
+    return max(int(0.1 * (size ** 0.75)), 1) + 100
 
 
 # ============================================================================
@@ -86,10 +86,10 @@ class TrainingConfig:
     train_batch_size: int = 8192
     validation_batch_size: Optional[int] = None
     prediction_batch_size: int = 262144
-    shuffle: bool = False
     learning_rate: float = 0.001
     optimizer: str = "adam"
     clip_norm: Optional[float] = 1.0
+    shuffle: bool = True
 
 
 @dataclass
@@ -209,13 +209,37 @@ class RuntimeConfig:
     """Runtime behavior and reproducibility configuration."""
     show_live_plots: bool = False
     show_live_r2: bool = True
+    # Which R² family streams per-epoch as ``r2_percent`` / ``val_r2_percent``,
+    # driving BOTH the live training plot and the fuzzy-stop monitor. One of
+    # "square_corr", "r2_zero", "r2_classic", "r2_histmean" (see R2_FAMILIES).
+    live_r2_metric: str = "square_corr"
+    # Hard bottom (percent) for the live/saved R² axis when an UNBOUNDED family
+    # is selected (r2_zero / r2_classic / r2_histmean). The top still auto-tracks
+    # the running max; only this floor is fixed so the view doesn't jump around.
+    # Ignored for square_corr (already bounded to [0, 100]).
+    live_r2_floor: float = -5.0
     debug_memory: bool = False
     resume: Union[ResumeMode, str] = ResumeMode.UPDATE_EXISTING
     random_state: int = 42
+    # When True, model i in a sweep is seeded with ``random_state + i`` (the
+    # original per-model behaviour) so each size gets its own init/shuffle
+    # stream. When False (default) every model shares ``random_state`` for a
+    # clean size-only comparison.
+    vary_seed_per_model: bool = False
     run_name: Optional[str] = None
+    # Optional prefix prepended to every model name -> "<prefix>_model_<size>".
+    # Used to stamp the date a model could earliest have been estimated.
+    model_name_prefix: Optional[str] = None
 
     def __post_init__(self):
         self.resume = ResumeMode.coerce(self.resume)
+        self.vary_seed_per_model = bool(self.vary_seed_per_model)
+        self.live_r2_metric = str(self.live_r2_metric)
+        if self.live_r2_metric not in R2_FAMILIES:
+            raise ValueError(
+                f"live_r2_metric must be one of {R2_FAMILIES}, "
+                f"got {self.live_r2_metric!r}"
+            )
 
 
 @dataclass
@@ -224,8 +248,8 @@ class ComputeConfig:
     precision: Union[int, str] = 32
     mixed_precision_policy: Optional[str] = None
     enable_determinism: bool = True
-    allow_tf32: bool = False
-    flop_estimator: Optional[Callable[[int, int, int, List[int], Model], Union[int, float]]] = None
+    enable_tensor_float_32: bool = False
+    flop_estimator: Optional[Callable[[int, int, int, List[int], Any], Union[int, float]]] = None
     _PRECISION_TO_POLICY: ClassVar[Dict[int, str]] = {
         8: "mixed_float8",
         16: "mixed_float16",
@@ -249,6 +273,8 @@ class ComputeConfig:
 
         if self.mixed_precision_policy is not None:
             self.mixed_precision_policy = str(self.mixed_precision_policy)
+        self.enable_determinism = bool(self.enable_determinism)
+        self.enable_tensor_float_32 = bool(self.enable_tensor_float_32)
 
     def resolve_mixed_precision_policy(self) -> str:
         """Return the Keras dtype policy implied by this compute configuration."""
@@ -294,6 +320,7 @@ class OutputConfig:
     save_json: bool = True
     save_csv: bool = True
     save_models: bool = False
+    save_test_sample: bool = True
     artifacts: Union[ArtifactNames, Dict[str, Any]] = field(default_factory=ArtifactNames)
 
     def __post_init__(self):
@@ -349,6 +376,9 @@ class SplitConfig:
     mode: Union[SplitMode, str] = SplitMode.AUTO
     test_size: Union[float, str] = 0.2
     val_size: Union[float, str] = 0.125
+    # Earliest date kept in the TRAIN split (date_cutoffs mode only). None =
+    # current behaviour: train runs from the earliest date up to val_size.
+    train_start: Optional[Union[str, Any]] = None
     train_mask: Optional[Any] = None
     val_mask: Optional[Any] = None
     test_mask: Optional[Any] = None
@@ -481,10 +511,14 @@ class PortfolioConfig:
     """Portfolio analysis mode and optional panel asset identity configuration."""
     mode: Union[PortfolioMode, str] = PortfolioMode.PANEL
     asset_id_col: Optional[str] = None
+    enabled: bool = True
 
     def __post_init__(self):
+        self.enabled = bool(self.enabled)
         if not isinstance(self.mode, PortfolioMode):
             self.mode = PortfolioMode(str(self.mode).lower())
+        if self.mode == PortfolioMode.NONE:
+            self.enabled = False
         if self.asset_id_col is not None:
             self.asset_id_col = str(self.asset_id_col)
 

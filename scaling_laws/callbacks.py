@@ -10,22 +10,97 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.callbacks import Callback
 
+# R² family identifiers and plot labels shared across the metric, config, and
+# plot labelling. Defined in the tensorflow-free enums module so config.py can
+# validate against them without importing this (tensorflow-heavy) module.
+from .enums import R2_FAMILIES, R2_FAMILY_LABELS
+
+
+def compute_r2_ylim(
+        series: List[List[float]],
+        bounded: bool,
+        floor: float = -5.0,
+        pad_frac: float = 0.1,
+        min_pad: float = 0.1,
+):
+    """``(lo, hi)`` for the R² twin-axis (percent units), or ``None`` if empty.
+
+    ``series`` is a list of equal-length per-epoch value lists (typically the
+    train and validation R² curves); values may be NaN.
+
+    ``square_corr`` is bounded to [0, 1], so when ``bounded`` is True we keep
+    the exact min/max view it has always had. The R²-style families
+    (``r2_zero`` / ``r2_classic`` / ``r2_histmean``) are bounded ABOVE by 1 but
+    unbounded BELOW — their warm-up epochs can sit at absurd negatives (e.g.
+    -10000%) that flatten the whole curve. For those the bottom of the axis is
+    pinned to a fixed ``floor`` (in percent) so it never moves, while the TOP
+    still tracks the running max (+ padding). Only one edge of the view moves,
+    which keeps the eye anchored; epochs below ``floor`` simply run off-screen.
+    """
+    finite = [float(v) for s in series for v in s
+              if v is not None and np.isfinite(v)]
+    if not finite:
+        return None
+    arr = np.asarray(finite, dtype=float)
+
+    if bounded:
+        lo, hi = float(arr.min()), float(arr.max())
+        if lo == hi:
+            lo, hi = lo - 1.0, hi + 1.0
+        pad = max((hi - lo) * pad_frac, min_pad)
+        return lo - pad, hi + pad
+
+    # Unbounded families: hard fixed bottom, auto-tracking top.
+    lo = float(floor)
+    hi = float(arr.max())
+    if hi <= lo:  # nothing above the floor yet (early warm-up) -> minimal span
+        hi = lo + 1.0
+    pad = max((hi - lo) * pad_frac, min_pad)
+    return lo, hi + pad
+
 
 class R2PercentMetric(tf.keras.metrics.Metric):
-    """Streaming squared-correlation R2 metric reported as a percentage."""
+    """Streaming per-epoch R² family metric, reported as a percentage.
 
-    def __init__(self, name: str = "r2_percent", **kwargs):
+    Selectable via ``family`` (default ``"square_corr"`` preserves the
+    historical behaviour, where this metric is logged as ``r2_percent`` /
+    ``val_r2_percent`` and read by the live plot and the fuzzy-stop monitor):
+
+      * ``"square_corr"`` – cov(y, ŷ)² / (var(y)·var(ŷ)), clipped to [0, 1].
+      * ``"r2_zero"``     – 1 − SSE / Σy²              (zero benchmark).
+      * ``"r2_classic"``  – 1 − SSE / Σ(y − ȳ_eval)²    (in-sample mean).
+      * ``"r2_histmean"`` – 1 − SSE / Σ(y − c)²         (historical mean ``c``).
+
+    For ``r2_histmean`` the baseline ``c`` is a fixed scalar passed at
+    construction (the training-set mean of Y) and used for both the train and
+    the validation curve — matching ``_compute_r2_family``'s leakage-safe
+    convention, where the validation baseline is also the train mean. Only
+    ``square_corr`` is clipped to [0, 1]; the three R²-style families may be
+    negative and are returned as-is (NaN if their denominator is degenerate).
+    """
+
+    def __init__(self, name: str = "r2_percent", family: str = "square_corr",
+                 hist_baseline: float = 0.0, **kwargs):
         super().__init__(name=name, **kwargs)
+        family = str(family)
+        if family not in R2_FAMILIES:
+            raise ValueError(
+                f"family must be one of {R2_FAMILIES}, got {family!r}"
+            )
+        self.family = family
+        self.hist_baseline = float(hist_baseline)
         self.sum_y = self.add_weight(name="sum_y", initializer="zeros")
         self.sum_y2 = self.add_weight(name="sum_y2", initializer="zeros")
         self.sum_pred = self.add_weight(name="sum_pred", initializer="zeros")
         self.sum_pred2 = self.add_weight(name="sum_pred2", initializer="zeros")
         self.sum_y_pred = self.add_weight(name="sum_y_pred", initializer="zeros")
+        self.sum_sq_err = self.add_weight(name="sum_sq_err", initializer="zeros")
         self.count = self.add_weight(name="count", initializer="zeros")
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_true = tf.reshape(tf.cast(y_true, tf.float32), [-1])
         y_pred = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
+        sq_err = tf.square(y_true - y_pred)
 
         if sample_weight is not None:
             sample_weight = tf.reshape(tf.cast(sample_weight, tf.float32), [-1])
@@ -34,6 +109,7 @@ class R2PercentMetric(tf.keras.metrics.Metric):
             pred_for_sums = y_pred * sample_weight
             pred2_for_sums = tf.square(y_pred) * sample_weight
             y_pred_for_sums = y_true * y_pred * sample_weight
+            sq_err_for_sums = sq_err * sample_weight
             count = tf.reduce_sum(sample_weight)
         else:
             y_for_sums = y_true
@@ -41,6 +117,7 @@ class R2PercentMetric(tf.keras.metrics.Metric):
             pred_for_sums = y_pred
             pred2_for_sums = tf.square(y_pred)
             y_pred_for_sums = y_true * y_pred
+            sq_err_for_sums = sq_err
             count = tf.cast(tf.size(y_true), tf.float32)
 
         self.sum_y.assign_add(tf.reduce_sum(y_for_sums))
@@ -48,15 +125,39 @@ class R2PercentMetric(tf.keras.metrics.Metric):
         self.sum_pred.assign_add(tf.reduce_sum(pred_for_sums))
         self.sum_pred2.assign_add(tf.reduce_sum(pred2_for_sums))
         self.sum_y_pred.assign_add(tf.reduce_sum(y_pred_for_sums))
+        self.sum_sq_err.assign_add(tf.reduce_sum(sq_err_for_sums))
         self.count.assign_add(count)
 
     def result(self):
         count = tf.maximum(self.count, 1.0)
-        y_var = self.sum_y2 - tf.square(self.sum_y) / count
-        pred_var = self.sum_pred2 - tf.square(self.sum_pred) / count
-        cov = self.sum_y_pred - (self.sum_y * self.sum_pred) / count
-        r2 = tf.square(cov) / tf.maximum(y_var * pred_var, tf.keras.backend.epsilon())
-        return 100.0 * tf.clip_by_value(r2, 0.0, 1.0)
+
+        if self.family == "square_corr":
+            y_var = self.sum_y2 - tf.square(self.sum_y) / count
+            pred_var = self.sum_pred2 - tf.square(self.sum_pred) / count
+            cov = self.sum_y_pred - (self.sum_y * self.sum_pred) / count
+            r2 = tf.square(cov) / tf.maximum(
+                y_var * pred_var, tf.keras.backend.epsilon()
+            )
+            return 100.0 * tf.clip_by_value(r2, 0.0, 1.0)
+
+        # R²-style families: 1 - SSE / denom. Each differs only in the
+        # benchmark whose squared deviations form the denominator.
+        sse = self.sum_sq_err
+        if self.family == "r2_zero":
+            denom = self.sum_y2
+        elif self.family == "r2_classic":
+            denom = self.sum_y2 - tf.square(self.sum_y) / count
+        else:  # r2_histmean: Σ(y - c)² = Σy² - 2c·Σy + n·c²
+            c = self.hist_baseline
+            denom = self.sum_y2 - 2.0 * c * self.sum_y + count * (c * c)
+
+        # Guard a degenerate (zero / non-finite) denominator -> NaN, which the
+        # live plot renders as a gap and the fuzzy stop skips, instead of
+        # emitting a spurious ±inf.
+        nan = tf.constant(float("nan"), dtype=tf.float32)
+        safe = tf.logical_and(tf.math.is_finite(denom),
+                              tf.abs(denom) > tf.keras.backend.epsilon())
+        return tf.where(safe, 100.0 * (1.0 - sse / denom), nan)
 
     def reset_state(self):
         for variable in self.variables:
@@ -94,11 +195,20 @@ class LivePlotCallback(Callback):
     _train_r2_line: ClassVar[Any] = None
     _val_r2_line: ClassVar[Any] = None
     _window_has_r2: ClassVar[bool] = False
+    _r2_label: ClassVar[str] = "Square Correlation"
 
-    def __init__(self, show_r2: bool = True, target_params: Optional[int] = None):
+    def __init__(self, show_r2: bool = True, target_params: Optional[int] = None,
+                 r2_label: str = "Square Correlation", r2_bounded: bool = True,
+                 r2_floor: float = -5.0):
         super().__init__()
         self.show_r2 = show_r2
         self.target_params = target_params
+        self.r2_label = r2_label
+        # square_corr lives in [0, 1]; the R²-style families are unbounded
+        # below, so their axis bottom is pinned to ``r2_floor`` (percent) while
+        # the top auto-tracks the running max (see compute_r2_ylim).
+        self.r2_bounded = r2_bounded
+        self.r2_floor = r2_floor
         self.losses: List[float] = []
         self.val_losses: List[float] = []
         self.r2_values: List[float] = []
@@ -124,7 +234,7 @@ class LivePlotCallback(Callback):
         return f"{text}{suffix}"
 
     @classmethod
-    def _build_window(cls, show_r2: bool):
+    def _build_window(cls, show_r2: bool, r2_label: str = "Square Correlation"):
         # Lazy imports so a missing tkinter on a headless box only fails
         # when show_live_plots is actually requested.
         import tkinter as tk
@@ -135,6 +245,7 @@ class LivePlotCallback(Callback):
         cls._root.title("Training Progress")
         cls._root.protocol("WM_DELETE_WINDOW", cls._on_window_close)
         cls._window_has_r2 = show_r2
+        cls._r2_label = r2_label
 
         # Use a bare Figure (not plt.figure) so we never touch pyplot's
         # global state for the live window.
@@ -154,19 +265,19 @@ class LivePlotCallback(Callback):
         if show_r2:
             cls._ax_r2 = cls._ax.twinx()
             cls._train_r2_line, = cls._ax_r2.plot(
-                [], [], 'b--', label='Training R²', linewidth=2
+                [], [], 'b--', label=f'Train {r2_label}', linewidth=2
             )
             cls._val_r2_line, = cls._ax_r2.plot(
-                [], [], 'r--', label='Validation R²', linewidth=2
+                [], [], 'r--', label=f'Val {r2_label}', linewidth=2
             )
-            cls._ax_r2.set_ylabel('R² (%)')
+            cls._ax_r2.set_ylabel(f'{r2_label} (%)')
             handles = [
                 cls._train_line, cls._val_line,
                 cls._train_r2_line, cls._val_r2_line,
             ]
             labels = [
                 'Training Loss', 'Validation Loss',
-                'Training R²', 'Validation R²',
+                f'Train {r2_label}', f'Val {r2_label}',
             ]
             cls._ax.legend(handles, labels, loc='upper left')
         else:
@@ -229,7 +340,7 @@ class LivePlotCallback(Callback):
 
         cls = type(self)
         if cls._root is None:
-            cls._build_window(self.show_r2)
+            cls._build_window(self.show_r2, self.r2_label)
 
         # Reset the existing window's axes and lines in-place.
         cls._root.title(title_text)
@@ -297,15 +408,12 @@ class LivePlotCallback(Callback):
             cls._train_r2_line.set_data(self.epochs_list, self.r2_values)
             cls._val_r2_line.set_data(self.epochs_list, self.val_r2_values)
 
-            finite_r2 = [v for v in (*self.r2_values, *self.val_r2_values)
-                         if v is not None and np.isfinite(v)]
-            if finite_r2:
-                r2min = min(finite_r2)
-                r2max = max(finite_r2)
-                if r2min == r2max:
-                    r2min, r2max = r2min - 1.0, r2max + 1.0
-                pad = max((r2max - r2min) * 0.1, 0.1)
-                cls._ax_r2.set_ylim(r2min - pad, r2max + pad)
+            ylim = compute_r2_ylim(
+                [self.r2_values, self.val_r2_values],
+                self.r2_bounded, floor=self.r2_floor,
+            )
+            if ylim is not None:
+                cls._ax_r2.set_ylim(*ylim)
 
         cls._canvas.draw()
         # Pump Tk's event loop so the OS actually paints the new
@@ -413,27 +521,32 @@ class SingleLineProgressCallback(Callback):
 
 
 class FuzzyStopCallback(Callback):
-    """Extend training past ``scheduled_epochs`` and stop at a local optimum.
+    """Extend training past ``scheduled_epochs`` and restore the global best.
 
-    The scheduled epoch count is treated as a hard *minimum* — training will
-    not terminate before it. Raw monitor values are recorded for the whole
-    run and converted to a causal median over the last ``smoothing_window``
-    values; the smoothed-best value, the raw value at that epoch, and the
-    weights at that epoch are tracked **only from the scheduled epoch
-    onwards**. So the local optimum we lock on to is one that occurred in
-    the extension window, not somewhere in the warm-up phase. Training
-    halts once either:
+    Raw monitor values are recorded for the whole run and converted to a
+    causal median over the last ``smoothing_window`` values. Two things are
+    tracked independently:
 
-    * ``patience`` epochs have elapsed since the last smoothed-best update
-      within the extension window — the smoothed metric has demonstrably
-      walked off its optimum, so we are past a local extremum; or
-    * the extra-epoch budget is exhausted — a hard cap so noisy runs that
-      never confirm a stop terminate in bounded time.
+    * **When to stop** — governed by an *extension-window* local optimum.
+      ``scheduled_epochs`` is a hard *minimum*: training never terminates
+      before it, and the smoothed-best used for the stop decision is tracked
+      only from the scheduled epoch onwards. Training halts once either
+      ``patience`` epochs have elapsed since that extension-window smoothed
+      best (we've demonstrably walked off a local optimum), or the
+      extra-epoch budget is exhausted (a hard cap for noisy runs).
+
+    * **Which weights to keep** — the *global* best. The smoothed-best value
+      and the weights at that epoch are tracked across the WHOLE run (from
+      epoch 0), so on stop we restore the best weights the model ever reached,
+      even if that was deep inside the scheduled floor. This does not cheat
+      the compute accounting: reaching the stop epoch is precisely what
+      revealed which earlier epoch was best, so the recorded compute remains
+      the full number of epochs trained.
 
     On stop, the current epoch's raw monitor value is compared against the
-    raw value at the smoothed-best epoch. If the current model is actually
-    better on the raw metric, its weights are kept; otherwise weights are
-    restored to the smoothed-best epoch (when ``restore_best_weights`` is
+    raw value at the global smoothed-best epoch. If the current model is
+    actually better on the raw metric, its weights are kept; otherwise weights
+    are restored to the global-best epoch (when ``restore_best_weights`` is
     True). The callback exposes ``triggered``, ``stop_reason``,
     ``actual_epochs``, ``restored_to_epoch``, and ``kept_current_epoch``
     for downstream logging.
@@ -466,10 +579,15 @@ class FuzzyStopCallback(Callback):
 
         self._raw_history: List[float] = []
         self._smoothed_history: List[float] = []
+        # Extension-window best: drives ONLY the stop-timing decision (tracked
+        # from the scheduled floor onwards).
         self._best_value: Optional[float] = None
-        self._best_raw: Optional[float] = None
         self._best_epoch: int = -1
-        self._best_weights: Optional[List[np.ndarray]] = None
+        # Global best: drives the WEIGHTS we restore (tracked from epoch 0).
+        self._global_best_value: Optional[float] = None
+        self._global_best_raw: Optional[float] = None
+        self._global_best_epoch: int = -1
+        self._global_best_weights: Optional[List[np.ndarray]] = None
         self._last_raw: Optional[float] = None
 
         self.triggered: bool = False
@@ -498,21 +616,30 @@ class FuzzyStopCallback(Callback):
         self._last_raw = raw
         self.actual_epochs = epoch + 1
 
+        # Global-best tracking runs every epoch (from epoch 0). These are the
+        # weights we restore on stop: the best the model ever reached, even if
+        # that was inside the scheduled floor. Compute is unaffected — we still
+        # trained the full run; that is what revealed this epoch was best.
+        if self._global_best_value is None or self._is_better(smoothed, self._global_best_value):
+            self._global_best_value = smoothed
+            self._global_best_raw = raw
+            self._global_best_epoch = epoch
+            if self.restore_best_weights:
+                self._global_best_weights = self.model.get_weights()
+
         # Phase 1: scheduled training is a hard floor — record raw history
-        # so smoothing is warm at the boundary, but do not track best or
-        # consider stopping.
+        # so smoothing is warm at the boundary, but do not consider stopping.
         if epoch + 1 < self.scheduled_epochs:
             return
 
-        # Phase 2: smoothed-best tracking starts at the scheduled boundary
-        # so the local optimum we lock on to is one found in the extension
-        # window, never one from the warm-up phase.
+        # Phase 2: the STOP-TIMING smoothed-best is tracked only from the
+        # scheduled boundary, so the local optimum that ends training is one
+        # found in the extension window, never one from the warm-up phase.
+        # (This decides *when* to stop; the *weights* restored are the global
+        # best tracked above.)
         if self._best_value is None or self._is_better(smoothed, self._best_value):
             self._best_value = smoothed
-            self._best_raw = raw
             self._best_epoch = epoch
-            if self.restore_best_weights:
-                self._best_weights = self.model.get_weights()
 
         epochs_since_best = epoch - self._best_epoch
         extra_epochs_used = (epoch + 1) - self.scheduled_epochs
@@ -527,33 +654,33 @@ class FuzzyStopCallback(Callback):
         self.stop_reason = reason
 
         # Final pick: compare the current epoch's raw monitor value against
-        # the raw value at the smoothed-best epoch. Keep current unless
+        # the raw value at the global smoothed-best epoch. Keep current unless
         # best is *strictly* better — that way ties (incl. the trivial
         # case where best epoch == current epoch) avoid an unnecessary
         # set_weights call. This guards against the smoothed-best epoch
         # being a lucky-smoothing point with a mediocre raw value, and
         # against the current epoch being a noise spike past a real peak.
         current_wins = (
-            self._best_raw is None
+            self._global_best_raw is None
             or self._last_raw is None
-            or not self._is_better(self._best_raw, self._last_raw)
+            or not self._is_better(self._global_best_raw, self._last_raw)
         )
 
         if current_wins:
             self.kept_current_epoch = True
             comparison_note = (
                 f"; kept current epoch (raw={self._last_raw:.6g}"
-                + (f" beats best-smoothed raw={self._best_raw:.6g}"
-                   if self._best_raw is not None else "")
+                + (f" beats global-best raw={self._global_best_raw:.6g}"
+                   if self._global_best_raw is not None else "")
                 + ")"
             )
-        elif self.restore_best_weights and self._best_weights is not None:
-            self.model.set_weights(self._best_weights)
-            self.restored_to_epoch = self._best_epoch + 1
+        elif self.restore_best_weights and self._global_best_weights is not None:
+            self.model.set_weights(self._global_best_weights)
+            self.restored_to_epoch = self._global_best_epoch + 1
             self.kept_current_epoch = False
             comparison_note = (
-                f"; restored weights to epoch {self.restored_to_epoch} "
-                f"(raw={self._best_raw:.6g} beats current raw={self._last_raw:.6g})"
+                f"; restored weights to global-best epoch {self.restored_to_epoch} "
+                f"(raw={self._global_best_raw:.6g} beats current raw={self._last_raw:.6g})"
             )
         else:
             self.kept_current_epoch = True

@@ -19,16 +19,17 @@ def test_default_config_constructs():
     assert config.architecture.activation == "relu"
     assert config.architecture.output_units == 1
     assert config.training.train_batch_size > 0
+    assert config.runtime.vary_seed_per_model is False
 
 
 def test_default_epochs_schedule():
     """Sanity check the epochs-per-model-size formula."""
     from scaling_laws import default_epochs_schedule
 
-    # 1K params:  0.75 * 1000^0.75  = 133.37 -> 133 + 100 = 233
-    assert default_epochs_schedule(1_000) == 233
-    # 10K params: 0.75 * 10000^0.75 = 750.00 -> 750 + 100 = 850
-    assert default_epochs_schedule(10_000) == 850
+    # 1K params:  0.1 * 1000^0.75  = 17.78 -> 17 + 100 = 117
+    assert default_epochs_schedule(1_000) == 117
+    # 10K params: 0.1 * 10000^0.75 = 100.00 -> 100 + 100 = 200
+    assert default_epochs_schedule(10_000) == 200
 
 
 def test_nested_config_dict_coercion():

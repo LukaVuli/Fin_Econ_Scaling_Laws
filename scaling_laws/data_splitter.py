@@ -72,7 +72,12 @@ class DataSplitter:
             target_col,
             date_col,
         )
-        model_data = model_data.sort_values(date_col, kind="mergesort")
+        sort_cols = [date_col]
+        if asset_id_col is not None and asset_id_col in model_data.columns:
+            sort_cols.append(asset_id_col)
+        else:
+            sort_cols.append(position_col)
+        model_data = model_data.sort_values(sort_cols, kind="mergesort")
 
         if mode == SplitMode.DATE_CUTOFFS:
             train_data, val_data, test_data, split_dates = self._split_by_date_cutoffs(
@@ -230,8 +235,30 @@ class DataSplitter:
                 f"test_size={split_config.test_size!r}"
             )
 
+        # Optional lower bound on the train window. None reproduces the original
+        # behaviour (train starts at the earliest available date).
+        train_start_cutoff = None
+        if split_config.train_start is not None:
+            try:
+                train_start_cutoff = pd.Timestamp(split_config.train_start)
+            except Exception as exc:
+                raise ValueError(
+                    "date_cutoffs split mode requires a parseable date-like "
+                    f"train_start value; got train_start={split_config.train_start!r}"
+                ) from exc
+            if train_start_cutoff >= val_cutoff:
+                raise ValueError(
+                    "date_cutoffs split mode requires train_start to be before the "
+                    f"val_size cutoff; got train_start={split_config.train_start!r}, "
+                    f"val_size={split_config.val_size!r}"
+                )
+
         unique_dates = self._unique_dates(model_data, date_col)
-        train_dates = [d for d in unique_dates if pd.Timestamp(d) < val_cutoff]
+        train_dates = [
+            d for d in unique_dates
+            if pd.Timestamp(d) < val_cutoff
+            and (train_start_cutoff is None or pd.Timestamp(d) >= train_start_cutoff)
+        ]
         val_dates = [
             d for d in unique_dates
             if val_cutoff <= pd.Timestamp(d) < test_cutoff

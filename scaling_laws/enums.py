@@ -29,6 +29,7 @@ class PortfolioMode(str, Enum):
     """Enumeration of supported portfolio analysis modes."""
     PANEL = "panel"
     TS = "ts"
+    NONE = "none"
 
 
 class ResumeMode(str, Enum):
@@ -83,4 +84,23 @@ VALID_BENCHMARK_MODES = {
     "historical_mean_updating",
     "ar1",
     "ar1_updating",
+}
+
+
+# R² families that can stream per-epoch to drive the live plot / fuzzy stop.
+# Kept here (tensorflow-free) so config.py can validate against it without
+# importing callbacks.py. The streaming metric and its plot labels live in
+# callbacks.py (R2PercentMetric, R2_FAMILY_LABELS).
+R2_FAMILIES = (
+    "square_corr",
+    "r2_zero",
+    "r2_classic",
+    "r2_histmean",
+)
+
+R2_FAMILY_LABELS = {
+    "square_corr": "Square Correlation",
+    "r2_zero": "R² (zero benchmark)",
+    "r2_classic": "R² (classic)",
+    "r2_histmean": "R² (historical mean)",
 }
