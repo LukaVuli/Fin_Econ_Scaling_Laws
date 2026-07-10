@@ -245,6 +245,9 @@ class ScalingLawExperiment:
         usually fine, but for cross-device forensic runs we want the same input
         mean/variance independent of CUDA vs Metal reduction order.
         """
+
+        normalizer.adapt(X_train)
+
         mean = np.mean(X_train, axis=0, dtype=np.float64).astype(np.float32)
         variance = np.var(X_train, axis=0, dtype=np.float64).astype(np.float32)
 
@@ -259,11 +262,10 @@ class ScalingLawExperiment:
                     count = np.asarray(X_train.shape[0], dtype=weights[2].dtype)
                     adapted.append(count.reshape(weights[2].shape))
                 normalizer.set_weights(adapted)
-                return
+                # return
         except Exception as exc:
             print(f"⚠ NumPy normalizer adaptation failed; falling back to Keras adapt: {exc}")
 
-        normalizer.adapt(X_train)
 
     @staticmethod
     def _tensorflow_runtime_info() -> Dict[str, Any]:
